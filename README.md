@@ -1,0 +1,2 @@
+# oracle
+secret oracle weapon
