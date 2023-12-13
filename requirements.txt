@@ -1,0 +1,8 @@
+oci~=2.99.1
+requests~=2.31.0
+loguru~=0.7.2
+cytoolz~=0.12.2
+python-telegram-bot~=20.0
+cloudflare~=2.14.3
+psutil~=5.9.7
+py-cpuinfo~=9.0.0

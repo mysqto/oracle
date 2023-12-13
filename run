@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+
+installed() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+error() {
+  # print error message in red and exit
+  echo -e "\033[0;31m$*\033[0m"
+  exit 1
+}
+
+warn() {
+  # print warning message in yellow
+  echo -e "\033[0;33m$*\033[0m"
+}
+
+# install pyenv and install latest python version
+os=$(uname -s)
+if [[ $os == "Darwin" ]]; then
+  if installed brew; then
+    brew update
+    brew install pyenv
+    brew install pyenv-virtualenv
+    brew install openssl readline sqlite3 xz zlib
+    brew install git
+  else
+    error "Homebrew not found. Install Homebrew first."
+  fi
+elif [[ $os == "Linux" ]]; then
+  # check package manager
+  if installed apt-get; then
+    sudo apt-get update
+    sudo apt-get install -y build-essential libssl-dev zlib1g-dev libbz2-dev \
+      libreadline-dev libsqlite3-dev wget curl llvm libncurses5-dev libncursesw5-dev \
+      xz-utils tk-dev libffi-dev liblzma-dev git
+  elif installed yum; then
+    sudo yum update
+    sudo yum install -y gcc openssl-devel bzip2-devel libffi-devel zlib-devel \
+      xz-devel readline-devel sqlite-devel wget curl llvm ncurses-devel ncurses \
+      openssl-devel tk-devel libffi-devel xz-libs git
+  elif installed pacman; then
+    sudo pacman -Syu
+    sudo pacman -S --noconfirm gcc openssl bzip2 libffi zlib xz readline sqlite \
+      wget curl llvm ncurses openssl tk libffi xz git
+  else
+    error "Package manager not found. Install pyenv manually."
+  fi
+
+  # install pyenv
+  export PYENV_ROOT="$HOME/.pyenv"
+  if [[ -d $PYENV_ROOT ]]; then
+    warn "pyenv already installed. Updating..."
+    cd "$PYENV_ROOT" >/dev/null 2>&1 || exit
+    git pull
+    cd - >/dev/null 2>&1 || exit
+  else
+    curl -sL https://pyenv.run | bash
+  fi
+
+  [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+  eval "$(pyenv init -)"
+fi
+
+# install latest python version
+latest_python_version=$(pyenv install --list | grep --extended-regexp "^\s*[0-9][0-9.]*[0-9]\s*$" | tail -1)
+latest_python_version=$(echo "$latest_python_version" | tr -d '[:space:]')
+pyenv install "$latest_python_version"
+
+# check latest python version installed
+if [[ $(pyenv versions | grep -c "$latest_python_version") -eq 0 ]]; then
+  error "Python $latest_python_version not installed."
+fi
+
+# set global python version
+pyenv global "$latest_python_version"
+
+# now install dependencies
+pip install -r requirements.txt
