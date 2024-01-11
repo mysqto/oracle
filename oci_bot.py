@@ -21,6 +21,7 @@ import signal
 import socket
 import string
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -30,14 +31,13 @@ from datetime import datetime
 from typing import Callable
 
 import cytoolz
-import oci
 import psutil
 import requests
 from CloudFlare import CloudFlare
 from cpuinfo import cpuinfo
 from loguru import logger
 from oci import signer
-from oci.config import validate_config
+from oci.config import validate_config, from_file
 from oci.core import ComputeClient, VirtualNetworkClient, BlockstorageClient
 from oci.core.models import Instance, Subnet, Shape, Image, Vcn, Vnic, Ipv6, PublicIp, PrivateIp, SecurityList, \
     UpdateSecurityListDetails, IngressSecurityRule, TcpOptions, PortRange, UdpOptions, EgressSecurityRule, RouteTable, \
@@ -46,8 +46,10 @@ from oci.core.models import Instance, Subnet, Shape, Image, Vcn, Vnic, Ipv6, Pub
     CreateBootVolumeDetails, BootVolumeSourceFromBootVolumeDetails, Volume, CreateVolumeDetails, \
     InstanceSourceViaImageDetails, CreateVnicDetails, LaunchInstanceShapeConfigDetails, LaunchInstanceDetails, \
     CreateRouteTableDetails, CreateInternetGatewayDetails, CreateVcnDetails, CreateSubnetDetails, CreateIpv6Details, \
-    UpdatePublicIpDetails, CreatePublicIpDetails
-from oci.exceptions import InvalidPrivateKey, MissingPrivateKeyPassphrase
+    UpdatePublicIpDetails, CreatePublicIpDetails, VolumeAttachment, UpdateBootVolumeDetails, \
+    AttachParavirtualizedVolumeDetails, IcmpOptions, CreateSecurityListDetails, CreateInstanceConsoleConnectionDetails
+from oci.database.models import ConsoleConnection
+from oci.exceptions import InvalidPrivateKey, MissingPrivateKeyPassphrase, ServiceError
 from oci.identity import IdentityClient
 from oci.identity.models import Tenancy, Region
 from oci.limits import LimitsClient
@@ -60,6 +62,71 @@ from telegram.constants import ParseMode, ChatType
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, \
     ConversationHandler, PicklePersistence, ApplicationHandlerStop, TypeHandler
 from telegram.helpers import escape_markdown
+
+iso_3166_1 = {
+    # see: https://www.iso.org/iso-3166-country-codes.html
+    "AF": True, "AX": True, "AL": True, "DZ": True, "AS": True,
+    "AD": True, "AO": True, "AI": True, "AQ": True, "AG": True,
+    "AR": True, "AM": True, "AW": True, "AU": True, "AT": True,
+    "AZ": True, "BS": True, "BH": True, "BD": True, "BB": True,
+    "BY": True, "BE": True, "BZ": True, "BJ": True, "BM": True,
+    "BT": True, "BO": True, "BQ": True, "BA": True, "BW": True,
+    "BV": True, "BR": True, "IO": True, "BN": True, "BG": True,
+    "BF": True, "BI": True, "KH": True, "CM": True, "CA": True,
+    "CV": True, "KY": True, "CF": True, "TD": True, "CL": True,
+    "CN": True, "CX": True, "CC": True, "CO": True, "KM": True,
+    "CG": True, "CD": True, "CK": True, "CR": True, "CI": True,
+    "HR": True, "CU": True, "CW": True, "CY": True, "CZ": True,
+    "DK": True, "DJ": True, "DM": True, "DO": True, "EC": True,
+    "EG": True, "SV": True, "GQ": True, "ER": True, "EE": True,
+    "ET": True, "FK": True, "FO": True, "FJ": True, "FI": True,
+    "FR": True, "GF": True, "PF": True, "TF": True, "GA": True,
+    "GM": True, "GE": True, "DE": True, "GH": True, "GI": True,
+    "GR": True, "GL": True, "GD": True, "GP": True, "GU": True,
+    "GT": True, "GG": True, "GN": True, "GW": True, "GY": True,
+    "HT": True, "HM": True, "VA": True, "HN": True, "HK": True,
+    "HU": True, "IS": True, "IN": True, "ID": True, "IR": True,
+    "IQ": True, "IE": True, "IM": True, "IL": True, "IT": True,
+    "JM": True, "JP": True, "JE": True, "JO": True, "KZ": True,
+    "KE": True, "KI": True, "KP": True, "KR": True, "KW": True,
+    "KG": True, "LA": True, "LV": True, "LB": True, "LS": True,
+    "LR": True, "LY": True, "LI": True, "LT": True, "LU": True,
+    "MO": True, "MK": True, "MG": True, "MW": True, "MY": True,
+    "MV": True, "ML": True, "MT": True, "MH": True, "MQ": True,
+    "MR": True, "MU": True, "YT": True, "MX": True, "FM": True,
+    "MD": True, "MC": True, "MN": True, "ME": True, "MS": True,
+    "MA": True, "MZ": True, "MM": True, "NA": True, "NR": True,
+    "NP": True, "NL": True, "NC": True, "NZ": True, "NI": True,
+    "NE": True, "NG": True, "NU": True, "NF": True, "MP": True,
+    "NO": True, "OM": True, "PK": True, "PW": True, "PS": True,
+    "PA": True, "PG": True, "PY": True, "PE": True, "PH": True,
+    "PN": True, "PL": True, "PT": True, "PR": True, "QA": True,
+    "RE": True, "RO": True, "RU": True, "RW": True, "BL": True,
+    "SH": True, "KN": True, "LC": True, "MF": True, "PM": True,
+    "VC": True, "WS": True, "SM": True, "ST": True, "SA": True,
+    "SN": True, "RS": True, "SC": True, "SL": True, "SG": True,
+    "SX": True, "SK": True, "SI": True, "SB": True, "SO": True,
+    "ZA": True, "GS": True, "SS": True, "ES": True, "LK": True,
+    "SD": True, "SR": True, "SJ": True, "SZ": True, "SE": True,
+    "CH": True, "SY": True, "TW": True, "TJ": True, "TZ": True,
+    "TH": True, "TL": True, "TG": True, "TK": True, "TO": True,
+    "TT": True, "TN": True, "TR": True, "TM": True, "TC": True,
+    "TV": True, "UG": True, "UA": True, "AE": True, "GB": True,
+    "US": True, "UM": True, "UY": True, "UZ": True, "VU": True,
+    "VE": True, "VN": True, "VG": True, "VI": True, "WF": True,
+    "EH": True, "YE": True, "ZM": True, "ZW": True, "XK": True,
+}
+
+
+def is_country_code(s: str) -> bool:
+    return s.upper() in iso_3166_1
+
+
+def in_country(region: dict, country_code: str) -> bool:
+    if region is None:
+        return False
+    return region['country_code'] == country_code.upper()
+
 
 __base_dir__ = ".oci"
 
@@ -97,16 +164,27 @@ def readable_speed(n):
     return f'{readable_bytes(n)}/s'
 
 
+_symbols = ('B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB')
+
+
 def readable_bytes(n, fmt="%(value).1f%(symbol)s"):
-    symbols = ('B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB')
     prefix = {}
-    for i, s in enumerate(symbols[1:]):
+    for i, s in enumerate(_symbols[1:]):
         prefix[s] = 1 << (i + 1) * 10
-    for symbol in reversed(symbols[1:]):
+    for symbol in reversed(_symbols[1:]):
         if abs(n) >= prefix[symbol]:
             value = float(n) / prefix[symbol]
             return fmt % locals()
-    return fmt % dict(symbol=symbols[0], value=n)
+    return fmt % dict(symbol=_symbols[0], value=n)
+
+
+def readable_size(n, base_unit='B', fmt="%(value).1f%(symbol)s"):
+    base_unit = base_unit.upper()
+    if base_unit not in _symbols:
+        raise ValueError(f"base_unit {base_unit} is not supported")
+
+    index = _symbols.index(base_unit)
+    return readable_bytes(n * (1024 ** index), fmt)
 
 
 async def ping(host, ipv6=False, count=8, markdown=True) -> str:
@@ -171,6 +249,77 @@ def redact(s: str) -> str:
 
 def snake_to_camel(s: str) -> str:
     return ''.join(word.title() for word in s.split('_'))
+
+
+def _sorted(data: dict) -> dict:
+    for k, v in data.items():
+        if type(v) is dict:
+            data[k] = _sorted(v)
+    return {k: data[k] for k in sorted(data)}
+
+
+def unique_security_rules(rules: list[IngressSecurityRule | EgressSecurityRule]) \
+        -> list[IngressSecurityRule | EgressSecurityRule]:
+    if rules is None or len(rules) == 0:
+        return []
+
+    # unique with security_rule_equal
+    return list(filter(lambda x: not any(security_rule_equal(x, y) for y in rules[:rules.index(x)]), rules))
+
+
+def fix(p: PortRange) -> PortRange:
+    if p.min is None and p.max is not None:
+        p.min = p.max
+    if p.max is None and p.min is not None:
+        p.max = p.min
+    return p
+
+
+def port_range_equal(p1: PortRange, p2: PortRange) -> bool:
+    if p1 is None and p2 is None:
+        return True
+    if p1 is None or p2 is None:
+        return False
+    p1 = fix(p1)
+    p2 = fix(p2)
+    return p1.min == p2.min and p1.max == p2.max
+
+
+def icmp_options_equal(o1: IcmpOptions, o2: IcmpOptions) -> bool:
+    if o1 is None and o2 is None:
+        return True
+    if o1 is None or o2 is None:
+        return False
+
+    return o1.code == o2.code and o1.type == o2.type
+
+
+def options_equal(o1: TcpOptions | UdpOptions, o2: TcpOptions | UdpOptions) -> bool:
+    if o1 is None and o2 is None:
+        return True
+    if o1 is None or o2 is None:
+        return False
+    return port_range_equal(o1.destination_port_range, o2.destination_port_range) and \
+        port_range_equal(o1.source_port_range, o2.source_port_range)
+
+
+def bool_equal(b1: bool, b2: bool) -> bool:
+    b1 = False if b1 is None else b1
+    b2 = False if b2 is None else b2
+    return b1 == b2
+
+
+def security_rule_equal(r1: IngressSecurityRule | EgressSecurityRule,
+                        r2: IngressSecurityRule | EgressSecurityRule) -> bool:
+    if type(r1) is not type(r2):
+        return False
+    return r1.protocol == r2.protocol and \
+        options_equal(r1.tcp_options, r2.tcp_options) and \
+        options_equal(r1.udp_options, r2.udp_options) and \
+        icmp_options_equal(r1.icmp_options, r2.icmp_options) and \
+        bool_equal(r1.is_stateless, r2.is_stateless) and \
+        ((r1.source == r2.source and r1.source_type == r2.source_type) if isinstance(r1, IngressSecurityRule)
+         else (r1.description == r2.description and r1.destination_type == r2.destination_type))
 
 
 class Status:
@@ -402,6 +551,10 @@ oci_regions = {
         "country_code": "US",
         "city": "Ashburn",
     },
+    "iad": {
+        "country_code": "US",
+        "city": "Ashburn",
+    },
     "ap-seoul-1": {
         "country_code": "KR",
         "city": "Seoul",
@@ -509,10 +662,23 @@ oci_regions = {
 }
 
 
+def city(region: str) -> str:
+    if region not in oci_regions:
+        return region
+    return oci_regions[region]['city']
+
+
 def flag(region: str) -> str:
     if region not in oci_regions:
         return region
     return emoji(oci_regions[region]['country_code'].upper())
+
+
+def flagged_city(region: str) -> str:
+    if region not in oci_regions:
+        return region
+    oci_region = oci_regions[region]
+    return f'{flag(region)}{oci_region["city"]}'
 
 
 def escape_markdown_v2(text: any, version: int = 2) -> str:
@@ -932,6 +1098,7 @@ class TelegramBot:
         }
         try:
             response = requests.post(url, data=data)
+            logger.debug(response.text)
             if response.status_code != 200:
                 logger.warning(f"send message [{message}] failed, status code: {response.status_code}, "
                                f"response: {response.text}")
@@ -981,6 +1148,21 @@ class SSHKey:
     def from_dict(self, d: dict):
         for k, v in d.items():
             setattr(self, k, v)
+
+    def save(self) -> None | str:
+        if self.private_key is None or self.public_key is None:
+            return None
+        try:
+            # Create a temporary directory.
+            temp_dir = tempfile.mkdtemp()
+            private_key_file = os.path.join(temp_dir, f'oci-arm-{uuid.uuid4()}.pem')
+            with open(private_key_file, 'w') as pkf:
+                pkf.write(self.private_key)
+                os.chmod(private_key_file, 0o600)
+            return private_key_file
+        except Exception as e:
+            logger.error(f"failed to save private key, exception: {e}")
+            return None
 
 
 def is_success(status):
@@ -1283,7 +1465,7 @@ class OciConfig:
 def config_from_file(oci_config_file, oci_profile) -> OciConfig | None:
     try:
         if os.path.exists(oci_config_file):
-            config = oci.config.from_file(oci_config_file, oci_profile)
+            config = from_file(oci_config_file, oci_profile)
             return OciConfig(**config)
     except Exception as e:
         logger.error(f"failed to load oci config from file {oci_config_file}, exception: {e}")
@@ -1355,8 +1537,8 @@ class OCIClient:
     __cloudflare__ = None
 
     def notify(self, message: str, update: Update = None):
-        self.telegram(message=message, update=update)
         self.warning(message)
+        self.telegram(message=message, update=update)
 
     def info(self, text):
         message = f"[{self.name().ljust(20)}] {text.replace('`', '')}"
@@ -1373,6 +1555,7 @@ class OCIClient:
 
     def telegram(self, message, update: Update = None):
         if self.telegram_bot is None:
+            logger.warning(f"telegram_bot is None, message will not be sent, please set telegram_bot")
             return
 
         reply_to_message_id = None
@@ -1383,6 +1566,7 @@ class OCIClient:
             chat_id = self.admin_chat_id
 
         if chat_id is None:
+            self.warning(f"chat_id is None, message will not be sent, please set admin_chat_id, update: {update}")
             return
 
         self.telegram_bot.send_message(chat_id=chat_id, message=message, reply_to_message_id=reply_to_message_id)
@@ -1542,7 +1726,7 @@ class OCIClient:
         if self.client_name is None:
             tenancy = self.get_tenancy()
             if isinstance(tenancy, Tenancy):
-                name = f'{tenancy.home_region_key}-{tenancy.name}'.lower()
+                name = f'{flagged_city(self.oci_config.region)}-{tenancy.name}'.lower()
                 self.client_name = name
         if self.client_name is None:
             if self.profile_name is not None:
@@ -1658,9 +1842,9 @@ class OCIClient:
         if region is None:
             return None
         code = codename(instance.shape_config.processor_description)
-        city = region['city'].replace(' ', '').lower()
+        profile_city = region['city'].replace(' ', '').lower()
         country = region['country_code'].lower()
-        location = f'{city}.{country}'
+        location = f'{profile_city}.{country}'
         if country in ['sg']:
             location = country
 
@@ -1669,13 +1853,13 @@ class OCIClient:
     def list_regions(self) -> list[Region] | Status:
         try:
             return self.identity_client.list_regions().data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_services(self) -> list[ServiceSummary] | Status:
         try:
             return self.limits_client.list_services(self.compartment_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_limits(self, service_name="compute", scope_type="AD") -> list[LimitValueSummary] | Status:
@@ -1686,7 +1870,7 @@ class OCIClient:
             return self.limits_client.list_limit_values(compartment_id=self.compartment_id,
                                                         availability_domain=availability_domain,
                                                         service_name=service_name, scope_type=scope_type).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_resource_availability(self, limit_name, service_name="compute", scope_type="AD"):
@@ -1702,7 +1886,7 @@ class OCIClient:
             return self.limits_client.get_resource_availability(compartment_id=self.compartment_id,
                                                                 limit_name=limit_name, service_name=service_name,
                                                                 availability_domain=availability_domain).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_availability(self, shape):
@@ -1749,7 +1933,9 @@ class OCIClient:
                 task.fail()
             return
         instance_name = result.display_name
-        self.notify(message=f"instance `{escape_markdown_v2(instance_name)}` deleted", update=update)
+        self.notify(message=f"instance "
+                            f"`{escape_markdown_v2(self.name())}`\\-"
+                            f"`{escape_markdown_v2(instance_name)}` deleted", update=update)
         if task is not None:
             task.complete()
 
@@ -1797,7 +1983,7 @@ class OCIClient:
         self.notify(message=message, update=update)
         instance_name = create_instance_details.display_name
         self.info(
-            f"start_instance-No.{self.create_counter(machine=instance_name):012d}-{create_instance_details.shape}, "
+            f"create_instance-No.{self.create_counter(machine=instance_name):012d}-{create_instance_details.shape}, "
             f"start to create instance")
         while not exiting.is_set():
             try:
@@ -1807,20 +1993,21 @@ class OCIClient:
                     if is_rate_limit(result):
                         if self.wait_time < 120:
                             self.wait_time += 15
-                        self.warning(f"start_instance-No.{self.create_counter(machine=instance_name):012d}-"
+                        self.warning(f"create_instance-No.{self.create_counter(machine=instance_name):012d}-"
                                      f"{create_instance_details.shape}, rate limit, wait {self.wait_time}s")
                         exiting.wait(self.wait_time)
                     elif is_out_of_host_capacity(result):
                         # no rate limit, but out of host capacity, can reduce wait time
                         if self.wait_time > 30:
                             self.wait_time -= 10
-                        self.warning(f"start_instance-No.{self.create_counter(machine=instance_name):012d}-"
+                        self.warning(f"create_instance-No.{self.create_counter(machine=instance_name):012d}-"
                                      f"{create_instance_details.shape}, "
                                      f"no rate limit, but out of host capacity, wait {self.wait_time}s")
                         exiting.wait(self.wait_time)
                     elif is_quota_exceeded(result):
                         self.notify(
-                            message=f"start\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
+                            message=f"create\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
+                                    f"`{escape_markdown_v2(self.name())}`\\-"
                                     f"`{escape_markdown_v2(create_instance_details.shape)}`, "
                                     f"quota exceeded, details: `{escape_markdown_v2(result.message)}`, "
                                     f"stop create instance",
@@ -1830,7 +2017,8 @@ class OCIClient:
                         break
                     else:
                         self.notify(
-                            message=f"start\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
+                            message=f"create\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
+                                    f"`{escape_markdown_v2(self.name())}`\\-"
                                     f"`{escape_markdown_v2(create_instance_details.shape)}`, "
                                     f"failed to create instance, details: `{escape_markdown_v2(result.message)}`, "
                                     f"wait {self.wait_time}s",
@@ -1840,7 +2028,8 @@ class OCIClient:
                     result = self.wait_for_instance_status(instance_id=result.id, exiting=exiting)
                     if isinstance(result, Status):
                         self.notify(
-                            message=f"start\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
+                            message=f"create\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
+                                    f"`{escape_markdown_v2(self.name())}`\\-"
                                     f"`{escape_markdown_v2(create_instance_details.shape)}`,"
                                     f"instance created "
                                     f"`{escape_markdown_v2(instance_name)}`, "
@@ -1852,13 +2041,15 @@ class OCIClient:
                         break
                     public_ips = self.check_and_get_public_ips(instance_id=result.id, enable_ipv6=True)
                     if len(public_ips) == 0:
-                        self.notify(f"start\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
+                        self.notify(
+                            message=f"create\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
+                                    f"`{escape_markdown_v2(self.name())}`\\-"
                                     f"`{escape_markdown_v2(create_instance_details.shape)}`,"
                                     f"instance created "
                                     f"`{escape_markdown_v2(instance_name)}`: \n"
                                     f"•  *but no public ip found*, "
                                     f"•  instance status: `{escape_markdown_v2(result.lifecycle_state)}`",
-                                    update=update)
+                            update=update)
                         if task is not None:
                             task.fail()
                         break
@@ -1877,41 +2068,27 @@ class OCIClient:
                     allowed_ports_str = markdown_dict(allowed_ports)
                     dns_records_str = "".join(c.markdown() for c in ip_changes)
 
-                    self.notify(message=f"start\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
-                                        f"`{escape_markdown_v2(create_instance_details.shape)}`, instance created "
-                                        f"`{escape_markdown_v2(instance_name)}`: \n"
-                                        f"•  instance status: `{escape_markdown_v2(result.lifecycle_state)}`\n"
-                                        f"•  allowed ports: \n{allowed_ports_str}"
-                                        f"•  dns records: \n"
-                                        f"•  ip: {ip_str}\n"
-                                        f"{dns_records_str}",
-                                update=update)
+                    self.notify(
+                        message=f"create\\_instance\\-No\\.{self.create_counter(machine=instance_name):012d}\\-"
+                                f"`{escape_markdown_v2(self.name())}`\\-"
+                                f"`{escape_markdown_v2(create_instance_details.shape)}`, instance created "
+                                f"`{escape_markdown_v2(instance_name)}`: \n"
+                                f"•  instance status: `{escape_markdown_v2(result.lifecycle_state)}`\n"
+                                f"•  allowed ports: \n{allowed_ports_str}"
+                                f"•  dns records: \n"
+                                f"•  ip: {ip_str}\n"
+                                f"{dns_records_str}",
+                        update=update)
                     if task is not None:
                         task.complete()
                     break
             except Exception as e:
                 self.warning(
-                    f"start_instance-No.{self.create_counter(machine=instance_name):012d}"
+                    f"create_instance-No.{self.create_counter(machine=instance_name):012d}"
                     f"-{create_instance_details.shape}, "
                     f"failed to create instance, details: {e}, "
                     f"wait {self.wait_time}s")
                 exiting.wait(self.wait_time)
-
-    def check_dns_record(self, record_name, record_type="A", zone_name=None):
-        pass
-
-    def allow_ports(self, instance_id, min_port, max_port, direction="INGRESS", protocol="ALL"):
-        self.info(f"start to allow port for {instance_id} with {direction} {protocol} {min_port}-{max_port}")
-        vcns = self.get_instance_vcns(instance_id)
-        if isinstance(vcns, Status):
-            self.warning(f"fail to allow port for {instance_id} with {direction} {protocol} {min_port}-{max_port}，"
-                         f"vcn not found, details: {vcns.message}")
-            return
-        for vcn in vcns:
-            is_ipv6_enabled = vcn.ipv6_cidr_blocks is not None and len(vcn.ipv6_cidr_blocks) > 0
-            self.allow_vcn_ports(vcn, min_port, max_port, direction=direction, protocol=protocol)
-            if is_ipv6_enabled:
-                self.allow_vcn_ports(vcn, min_port, max_port, is_ipv6=True, direction=direction, protocol=protocol)
 
     def allow_vcn_ports(self, vcn, min_port=None, max_port=None, is_ipv6=False, direction="INGRESS", protocol="ALL"):
         vcn_id = vcn.id
@@ -1929,10 +2106,17 @@ class OCIClient:
             self.warning(f"fail to allow port(s) for VCN-{vcn_name}: {description}，"
                          f"security list not found, details: {security_lists.message}")
             return
+        if len(security_lists) == 0:
+            self.warning(f"no security list found for VCN-{vcn_name}, "
+                         f"try to create a new one")
+            security_list = self.create_vcn_security_list(vcn)
+            if isinstance(security_list, Status):
+                self.warning(f"fail to create security list for VCN-{vcn_name}, details: {security_list.message}")
+                return
+            security_lists = [security_list]
         for security_list in security_lists:
             self.allow_security_list_ports(security_list.id, min_port, max_port, is_ipv6=is_ipv6, direction=direction,
                                            protocol=protocol)
-        pass
 
     def allow_security_list_ports(self, security_list_id, min_port, max_port, is_ipv6=False, direction="INGRESS",
                                   protocol="ALL"):
@@ -1987,6 +2171,36 @@ class OCIClient:
             self.info(f"success to add rule to Security List-{security_list_name}: "
                       f"{direction} {protocol} {min_port}-{max_port}")
 
+    def create_vcn_security_list(self, vcn: Vcn) -> SecurityList | Status:
+        try:
+            return self.network_client.create_security_list(
+                create_security_list_details=CreateSecurityListDetails(
+                    compartment_id=self.compartment_id,
+                    vcn_id=vcn.id,
+                    display_name=f"{vcn.display_name}-Security-List",
+                )).data
+        except ServiceError as e:
+            return Status(e.status, e.code, e.message)
+
+    async def clear_vcn_security_lists(self, vcn: Vcn):
+        security_lists = self.get_vcn_security_list(vcn.id)
+        if isinstance(security_lists, Status):
+            self.warning(f"fail to clear Security Lists of VCN-{vcn.display_name}, details: {security_lists}")
+            return security_lists
+        for security_list in security_lists:
+            result = self.clear_security_list_rules(security_list.id)
+            if is_failed(result):
+                self.warning(f"fail to clear Security List-{security_list.display_name}, details: {result}")
+            else:
+                self.info(f"success to clear Security List-{security_list.display_name}")
+
+    def delete_security_list(self, security_list_id) -> Status:
+        try:
+            self.network_client.delete_security_list(security_list_id=security_list_id)
+            return Status(http.client.OK, "Success", "success")
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
     def get_instance_vcns(self, instance_id) -> list[Vcn] | Status:
         vnics = self.list_vnics(instance_id)
         if isinstance(vnics, Status):
@@ -2007,13 +2221,13 @@ class OCIClient:
     def get_vcn_security_list(self, vcn_id) -> list[SecurityList] | Status:
         try:
             return self.network_client.list_security_lists(compartment_id=self.compartment_id, vcn_id=vcn_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_security_list(self, security_list_id) -> SecurityList | Status:
         try:
             return self.network_client.get_security_list(security_list_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def add_security_rule(self, security_list_id, ingress_security_rules=None, egress_security_rules=None) -> Status:
@@ -2027,13 +2241,24 @@ class OCIClient:
                 return security_list
             ingress_security_rules += security_list.ingress_security_rules
             egress_security_rules += security_list.egress_security_rules
-            ingress_security_rules = list(cytoolz.unique(ingress_security_rules, key=lambda x: x.description))
-            egress_security_rules = list(cytoolz.unique(egress_security_rules, key=lambda x: x.description))
-            return self.network_client.update_security_list(security_list_id=security_list_id,
-                                                            update_security_list_details=UpdateSecurityListDetails(
-                                                                ingress_security_rules=ingress_security_rules,
-                                                                egress_security_rules=egress_security_rules, )).data
-        except oci.exceptions.ServiceError as e:
+            ingress_security_rules = unique_security_rules(ingress_security_rules)
+            egress_security_rules = unique_security_rules(egress_security_rules)
+            self.network_client.update_security_list(security_list_id=security_list_id,
+                                                     update_security_list_details=UpdateSecurityListDetails(
+                                                         ingress_security_rules=ingress_security_rules,
+                                                         egress_security_rules=egress_security_rules, ))
+            return Status(http.client.OK, "Success", "success")
+        except ServiceError as e:
+            return Status(e.status, e.code, e.message)
+
+    def clear_security_list_rules(self, security_list_id: str) -> Status:
+        try:
+            self.network_client.update_security_list(security_list_id=security_list_id,
+                                                     update_security_list_details=UpdateSecurityListDetails(
+                                                         ingress_security_rules=[],
+                                                         egress_security_rules=[]))
+            return Status(http.client.OK, "Success", "success")
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_allowed_ports(self, instance_id):
@@ -2074,7 +2299,7 @@ class OCIClient:
     def list_security_rules(self, vcn_id) -> list[SecurityList] | Status:
         try:
             return self.network_client.list_security_lists(compartment_id=self.compartment_id, vcn_id=vcn_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_vnics(self, instance_id) -> list[Vnic] | Status:
@@ -2159,7 +2384,7 @@ class OCIClient:
     def add_ipv6_to_vnic(self, vnic_id) -> Ipv6 | Status:
         try:
             return self.network_client.create_ipv6(CreateIpv6Details(vnic_id=vnic_id)).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def add_ipv6_cidr_to_subnet(self, subnet_id, cidr_block=None) -> Status:
@@ -2168,7 +2393,7 @@ class OCIClient:
                                                      add_subnet_ipv6_cidr_details=AddSubnetIpv6CidrDetails(
                                                          ipv6_cidr_block=cidr_block))
             return Status(http.client.OK, "Success", "Success")
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def enable_vcn_ipv6(self, vcn_id, with_subnet=True) -> Vcn | Status:
@@ -2238,7 +2463,7 @@ class OCIClient:
             self.network_client.add_ipv6_vcn_cidr(vcn_id=vcn_id, add_vcn_ipv6_cidr_details=AddVcnIpv6CidrDetails(
                 is_oracle_gua_allocation_enabled=True))
             return Status(http.client.OK, "Success", "Success")
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def default_vnic(self, instance_id) -> Vnic | Status:
@@ -2249,7 +2474,7 @@ class OCIClient:
             if len(data) != 0:
                 vnic_id = data[0].vnic_id
                 return self.network_client.get_vnic(vnic_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def wait_for_instance_status(self, instance_id,
@@ -2285,7 +2510,7 @@ class OCIClient:
     def get_instance(self, instance_id) -> Instance | Status:
         try:
             return self.oci_client.get_instance(instance_id=instance_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def resize_instance(self, **kwargs):
@@ -2309,7 +2534,9 @@ class OCIClient:
                                               memory_in_gbs=memory_in_gbs
                                           )))
         if is_failed(result):
-            self.notify(message=f"fai to resize instance\\-`{escape_markdown_v2(instance_id)}`, "
+            self.notify(message=f"fai to resize instance\\-"
+                                f"`{escape_markdown_v2(self.name())}`\\-"
+                                f"`{escape_markdown_v2(instance_name)}`, "
                                 f"details: {escape_markdown_v2(result.message)}",
                         update=update)
             if task is not None:
@@ -2320,7 +2547,9 @@ class OCIClient:
 
         result = self.wait_for_instance_status(instance_id=instance_id, exiting=exiting)
         if is_failed(result):
-            self.notify(message=f"fai to wait instance\\-`{escape_markdown_v2(instance_id)}` to "
+            self.notify(message=f"fai to wait instance\\-"
+                                f"`{escape_markdown_v2(self.name())}`\\-"
+                                f"`{escape_markdown_v2(instance_name)}` to "
                                 f"`RUNNING`, details: {escape_markdown_v2(result.message)}",
                         update=update)
             if task is not None:
@@ -2333,7 +2562,9 @@ class OCIClient:
         try:
             new_cpu_cores = int(result.shape_config.ocpus)
             new_memory_in_gbs = int(result.shape_config.memory_in_gbs)
-            self.notify(message=f"instance\\-`{escape_markdown_v2(instance_name)}` resized, from "
+            self.notify(message=f"instance\\-"
+                                f"`{escape_markdown_v2(self.name())}`\\-"
+                                f"`{escape_markdown_v2(instance_name)}` resized, from "
                                 f"`{escape_markdown_v2(str(old_cpu_cores))}C"
                                 f"{escape_markdown_v2(str(old_memory_in_gbs))}G` to "
                                 f"`{escape_markdown_v2(str(new_cpu_cores))}C"
@@ -2347,11 +2578,80 @@ class OCIClient:
             return self.get_instance(instance_id)
         try:
             return self.oci_client.update_instance(instance_id, update_instance_details=update_instance_details).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def rename_instance(self, instance_id, name):
         return self.update_instance(instance_id, UpdateInstanceDetails(display_name=name))
+
+    def list_instance_console_connections(self, instance_id) -> list[ConsoleConnection] | Status:
+        try:
+            return self.oci_client.list_instance_console_connections(
+                compartment_id=self.compartment_id,
+                instance_id=instance_id).data
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
+    def instance_console_connection(self, instance: Instance) -> list[ConsoleConnection] | Status:
+        console_connections = self.list_instance_console_connections(instance.id)
+        if isinstance(console_connections, Status):
+            return console_connections
+        if len(console_connections) == 0:
+            return Status(http.client.NOT_FOUND, "NoConsoleConnection", "console connection not found")
+
+        console_connections = list(cytoolz.filter(lambda x: x.lifecycle_state == "ACTIVE", console_connections))
+        if len(console_connections) == 0:
+            return Status(http.client.NOT_FOUND, "NoActiveConsoleConnection", "active console connection not found")
+        return console_connections[0]
+
+    def delete_instance_console_connections(self, instance: Instance) -> list[ConsoleConnection] | Status:
+        console_connections = self.list_instance_console_connections(instance.id)
+        if isinstance(console_connections, Status):
+            return console_connections
+        if len(console_connections) == 0:
+            return []
+
+        deleted_connections = []
+        console_connections = list(cytoolz.filter(lambda x: x.lifecycle_state == "ACTIVE", console_connections))
+        success = True
+        for console_connection in console_connections:
+            result = self.delete_console_connection(instance_console_connection_id=console_connection.id)
+            if is_failed(result):
+                logger.warning(f"fail to delete console connection-{console_connection.id}, details: {result}")
+                success = False
+            else:
+                deleted_connections.append(console_connection)
+                logger.info(f"success to delete console connection-{console_connection.id}")
+        if success:
+            return deleted_connections
+        else:
+            return Status(http.client.BAD_REQUEST, "FailToDeleteConsoleConnections",
+                          "fail to delete console connections")
+
+    def create_console_connection(self, instance_id: str, public_key: str) -> ConsoleConnection | Status:
+        try:
+            return self.oci_client.create_instance_console_connection(
+                create_instance_console_connection_details=CreateInstanceConsoleConnectionDetails(
+                    instance_id=instance_id,
+                    public_key=public_key,
+                )).data
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
+    def delete_console_connection(self, instance_console_connection_id: str) -> Status:
+        try:
+            self.oci_client.delete_instance_console_connection(
+                instance_console_connection_id=instance_console_connection_id)
+            return Status(http.client.OK, "Success", "success")
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
+    def get_instance_console_connection(self, instance_console_connection_id: str) -> ConsoleConnection | Status:
+        try:
+            return (self.oci_client.
+                    get_instance_console_connection(instance_console_connection_id=instance_console_connection_id).data)
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
 
     def check_and_get_public_ips(self, instance_id=None, enable_ipv6=False) -> list[IPAddress]:
         ips = self.get_public_ips(instance_id)
@@ -2509,7 +2809,7 @@ class OCIClient:
                                                  update_public_ip_details=UpdatePublicIpDetails(
                                                      private_ip_id=""))
             return Status(http.client.OK, "Success", "Success")
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def assign_static_public_ip(self, public_ip_id, private_ip_id):
@@ -2518,14 +2818,14 @@ class OCIClient:
                                                  update_public_ip_details=UpdatePublicIpDetails(
                                                      private_ip_id=private_ip_id))
             return Status(http.client.OK, "Success", "Success")
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def delete_public_ip(self, public_ip_id=None) -> Status:
         try:
             self.network_client.delete_public_ip(public_ip_id=public_ip_id)
             return Status(http.client.OK, "Success", "Success")
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def create_public_ip(self, lifetime="EPHEMERAL", private_ip_id=None) -> PublicIp | Status:
@@ -2533,7 +2833,7 @@ class OCIClient:
             return self.network_client.create_public_ip(
                 CreatePublicIpDetails(compartment_id=self.oci_config.compartment_id, lifetime=lifetime,
                                       private_ip_id=private_ip_id)).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_public_ip_info(self, ip_address):
@@ -2562,7 +2862,7 @@ class OCIClient:
     def get_vnic_public_ip_v4(self, vnic_id) -> str:
         try:
             return self.network_client.get_vnic(vnic_id).data.public_ip
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             self.warning(f'fal to get public ip for VNIC-{vnic_id}, details: {Status(e.status, e.code, e.message)}')
             return ""
 
@@ -2613,27 +2913,27 @@ class OCIClient:
     def get_vnic_ipv6s(self, vnic_id) -> list[Ipv6] | Status:
         try:
             return self.network_client.list_ipv6s(vnic_id=vnic_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def delete_ipv6(self, ipv6_id) -> Status:
         try:
             self.network_client.delete_ipv6(ipv6_id=ipv6_id)
             return Status(http.client.OK, "Success", "Success")
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_vnic(self, vnic_id) -> Vnic | Status:
         try:
             return self.network_client.get_vnic(vnic_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_vnic_attachments(self, instance_id=None):
         try:
             return self.oci_client.list_vnic_attachments(compartment_id=self.oci_config.compartment_id,
                                                          instance_id=instance_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def build_create_instance_details(self,
@@ -2651,7 +2951,7 @@ class OCIClient:
         if shape not in shapes:
             return Status(http.client.BAD_REQUEST, "InvalidShape",
                           f"shape `{escape_markdown_v2(shape)}` not found, please check your configuration, "
-                          f'avaiable shapes: {escape_markdown_v2(str(shapes))}')
+                          f'available shapes: {escape_markdown_v2(str(shapes))}')
 
         if subnet_id is None:
             subnet = self.default_subnet()
@@ -2710,7 +3010,7 @@ class OCIClient:
     def delete_instance(self, instance_id) -> Status:
         try:
             return self.oci_client.terminate_instance(instance_id)
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def create_instance(self, shape=None, create_instance_details=None) -> Instance | Status:
@@ -2739,7 +3039,7 @@ class OCIClient:
                 metadata=dict(
                     ssh_authorized_keys=create_instance_details.ssh_authorized_keys),
                 is_pv_encryption_in_transit_enabled=True, )).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_availability_domains(self):
@@ -2754,13 +3054,13 @@ class OCIClient:
     def get_tenancy(self) -> Tenancy | Status:
         try:
             return self.identity_client.get_tenancy(self.compartment_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_subnets(self, vcn_id=None) -> list[Subnet] | Status:
         try:
             return self.network_client.list_subnets(self.compartment_id, vcn_id=vcn_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def has_subnet(self) -> bool:
@@ -2772,13 +3072,13 @@ class OCIClient:
     def list_vcns(self) -> list[Vcn] | Status:
         try:
             return self.network_client.list_vcns(self.compartment_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_reserved_public_ips(self) -> list[PublicIp] | Status:
         try:
             return self.network_client.list_public_ips(scope="REGION", compartment_id=self.compartment_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_public_ips(self) -> list[PublicIp] | Status:
@@ -2790,13 +3090,13 @@ class OCIClient:
 
             reserved_ips = self.network_client.list_public_ips(scope="REGION", compartment_id=self.compartment_id).data
             return ephemeral_ips + reserved_ips
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_private_ips(self, subnet_id=None, vnic_id=None) -> list[PrivateIp] | Status:
         try:
             return self.network_client.list_private_ips(subnet_id=subnet_id, vnic_id=vnic_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def has_vcn(self) -> bool:
@@ -2808,7 +3108,7 @@ class OCIClient:
     def list_shapes(self) -> list[Shape] | Status:
         try:
             return self.oci_client.list_shapes(self.compartment_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_shape_names(self) -> list[str]:
@@ -2829,7 +3129,7 @@ class OCIClient:
                                                shape=shape,
                                                operating_system=operating_system,
                                                operating_system_version=operating_system_version).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def default_ubuntu_image(self, shape):
@@ -2843,7 +3143,7 @@ class OCIClient:
     def get_subnet(self, subnet_id) -> Subnet | Status:
         try:
             return self.network_client.get_subnet(subnet_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def default_subnet(self) -> Subnet | Status:
@@ -2986,7 +3286,7 @@ class OCIClient:
                 CreateRouteTableDetails(compartment_id=self.compartment_id, vcn_id=vcn_id,
                                         display_name=f"{self.name()}-route-table",
                                         route_rules=route_rules)).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def create_route_rule(self, route_table_id, network_entity_id, cidr_block) -> RouteTable | Status:
@@ -3002,7 +3302,7 @@ class OCIClient:
             return self.network_client.update_route_table(rt_id=route_table_id,
                                                           update_route_table_details=UpdateRouteTableDetails(
                                                               route_rules=route_rules)).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def create_internet_gateway(self, vcn_id, route_table_id=None) -> InternetGateway | Status:
@@ -3011,7 +3311,7 @@ class OCIClient:
                 CreateInternetGatewayDetails(compartment_id=self.compartment_id, vcn_id=vcn_id,
                                              route_table_id=route_table_id, is_enabled=True,
                                              display_name=f"{self.name()}-internet-gateway", )).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def create_vcn(self, enable_ipv6=False) -> Vcn | Status:
@@ -3021,31 +3321,31 @@ class OCIClient:
                                                     is_ipv6_enabled=enable_ipv6,
                                                     compartment_id=self.compartment_id,
                                                     display_name=f"{self.name()}-vcn", )).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_vcn(self, vcn_id) -> Vcn | Status:
         try:
             return self.network_client.get_vcn(vcn_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_route_table(self, route_table_id) -> RouteTable | Status:
         try:
             return self.network_client.get_route_table(rt_id=route_table_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_internet_gateway(self, internet_gateway_id) -> InternetGateway | Status:
         try:
             return self.network_client.get_internet_gateway(internet_gateway_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_internet_gateways(self, vcn_id=None) -> list[InternetGateway] | Status:
         try:
             return self.network_client.list_internet_gateways(compartment_id=self.compartment_id, vcn_id=vcn_id).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_vcn_internet_gateways(self, vcn_id):
@@ -3071,7 +3371,7 @@ class OCIClient:
                                                           display_name=f"{self.name()}-subnet",
                                                           vcn_id=vcn_id, cidr_block="10.0.0.0/24",
                                                           ipv6_cidr_block=ipv6_cidr_block, )).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_instances(self, status=None) -> list[Instance] | Status:
@@ -3082,7 +3382,7 @@ class OCIClient:
             for instance in instances:
                 if status is None or instance.lifecycle_state == status:
                     match_instances.append(instance)
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
         return match_instances
 
@@ -3092,7 +3392,7 @@ class OCIClient:
     def instance_action(self, instance_id, action="START") -> Instance | Status:
         try:
             return self.oci_client.instance_action(instance_id=instance_id, action=action).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def instance_action_task(self, **kwargs):
@@ -3106,7 +3406,9 @@ class OCIClient:
         instance_name = instance.display_name
 
         if exiting is None:
-            message = f"can not {action} instance: `{escape_markdown_v2(instance_name)}` \\- " \
+            message = f"can not {action} instance: " \
+                      f"`{escape_markdown_v2(self.name())}`\\-" \
+                      f"`{escape_markdown_v2(instance_name)}` \\- " \
                       f"`{escape_markdown_v2(self.get_primary_ipv4(instance_id))}`" \
                       f", exiting is None"
             self.notify(message, update)
@@ -3161,14 +3463,20 @@ class OCIClient:
                     if isinstance(result, Status):
                         self.notify(message=f'\\[instance action\\({action}\\)\\] \\- '
                                             f'No\\.{self.start_counter(machine=instance_name):012d}\\-`'
+                                            f"`{escape_markdown_v2(self.name())}`\\-"
                                             f'{escape_markdown_v2(instance_name)}`: '
                                             f'wait for starting instance failed, details: '
                                             f'{escape_markdown_v2(str(result))}, '
                                             f'please check manually', update=update)
-                        task.fail()
+                        self.warning(f"[instance action({action})] - "
+                                     f"No.{self.start_counter(machine=instance_name):012d}-`{instance_name}`: "
+                                     f"fail to do {action} on instance, details: {result}, "
+                                     f"wait {self.wait_time}s")
+                        exiting.wait(self.wait_time)
                         continue
                     message = (f'`{escape_markdown_v2(self.name())}` \\[instance action\\({action}\\)\\]  \\- '
                                f'No\\.{self.start_counter(machine=instance_name):012d}\\-`'
+                               f"`{escape_markdown_v2(self.name())}`\\-"
                                f'{escape_markdown_v2(instance_name)}`: '
                                f'action `{action}` success, '
                                f'instance status: `{escape_markdown_v2(result.lifecycle_state)}`')
@@ -3182,6 +3490,36 @@ class OCIClient:
                                f"wait {self.wait_time}s")
                 exiting.wait(self.wait_time)
 
+    def wait_for_console_connection(self,
+                                    instance: Instance,
+                                    console_connection: ConsoleConnection,
+                                    exiting: threading.Event,
+                                    expected_lifecycle_state="ACTIVE"
+                                    ) -> ConsoleConnection | Status:
+        wait_time = 5
+        start_time = time.time()
+        console_connection_id = console_connection.id
+        while not exiting.is_set() and time.time() - start_time < 300:
+            try:
+                console_connection = self.get_instance_console_connection(console_connection_id)
+                if isinstance(console_connection, Status):
+                    self.warning(f"fail to get console connection [{instance.display_name}], "
+                                 f"details: {console_connection}, wait {wait_time}s")
+                    exiting.wait(wait_time)
+                    continue
+                lifecycle_state = console_connection.lifecycle_state
+                if lifecycle_state != expected_lifecycle_state:
+                    self.warning(f"waiting for console connection [{instance.display_name}] status, "
+                                 f"expected: {expected_lifecycle_state}, actual: {lifecycle_state}, wait {wait_time}s")
+                    exiting.wait(wait_time)
+                else:
+                    return console_connection
+            except Exception as e:
+                self.warning(f"fail to get console connection [{instance.display_name}], details: {e}, "
+                             f"wait {wait_time}s")
+                exiting.wait(wait_time)
+        return Status(http.client.BAD_REQUEST, "Timeout", "timeout")
+
     def create_boot_volume(self, display_name=None, source_id=None) -> BootVolume | Status:
         try:
             return self.block_storage_client.create_boot_volume(
@@ -3193,7 +3531,7 @@ class OCIClient:
                         id=source_id,
                     )
                 )).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def create_volume(self, display_name=None, size_in_gbs=50.0, source_id=None) -> Volume | Status:
@@ -3205,7 +3543,7 @@ class OCIClient:
                     vpus_per_gb=120,
                     source_id=source_id,
                 )).data
-        except oci.exceptions.ServiceError as e:
+        except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def list_boot_volume_attachments(self, instance_id=None,
@@ -3216,7 +3554,24 @@ class OCIClient:
                                                                 availability_domain=availability_domain,
                                                                 instance_id=instance_id,
                                                                 boot_volume_id=boot_volume_id).data
-        except oci.exceptions.ServiceError as ex:
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
+    def list_volume_attachments(self, instance_id=None,
+                                volume_id=None) -> list[VolumeAttachment] | Status:
+        try:
+            availability_domain = self.default_availability_domain().name
+            return self.oci_client.list_volume_attachments(compartment_id=self.compartment_id,
+                                                           availability_domain=availability_domain,
+                                                           instance_id=instance_id,
+                                                           volume_id=volume_id).data
+        except ServiceError as ex:
+            Status(ex.status, ex.code, ex.message)
+
+    def get_volume_attachment(self, attachment_id) -> VolumeAttachment | Status:
+        try:
+            return self.oci_client.get_volume_attachment(attachment_id).data
+        except ServiceError as ex:
             return Status(ex.status, ex.code, ex.message)
 
     def list_boot_volumes(self, instance_id=None) -> list[BootVolume] | Status:
@@ -3236,32 +3591,180 @@ class OCIClient:
             boot_volume_ids = [attachment.boot_volume_id for attachment in boot_volume_attachments if
                                attachment.instance_id == instance_id]
             return [boot_volume for boot_volume in boot_volumes if boot_volume.id in boot_volume_ids]
-        except oci.exceptions.ServiceError as ex:
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
+    def list_volumes(self, instance_id=None) -> list[Volume] | Status:
+        try:
+            volumes = self.block_storage_client.list_volumes(compartment_id=self.compartment_id).data
+            if instance_id is None:
+                return volumes
+            volume_attachments = self.list_volume_attachments(instance_id=instance_id)
+            if isinstance(volume_attachments, Status):
+                return volume_attachments
+            volume_ids = [attachment.volume_id for attachment in volume_attachments if
+                          attachment.instance_id == instance_id and attachment.lifecycle_state == "ATTACHED"]
+            return [volume for volume in volumes if volume.id in volume_ids]
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
+    def get_volume(self, volume_id, volume_type='BlockVolume') -> BootVolume | Volume | Status:
+        try:
+            return self.block_storage_client.get_volume(volume_id).data if volume_type != 'BlockVolume' else \
+                self.block_storage_client.get_boot_volume(volume_id).data
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
+    def wait_for_volume_status(self, volume: BootVolume | Volume,
+                               attachment: BootVolumeAttachment | VolumeAttachment,
+                               action, exiting) -> Status:
+        wait_time = 5
+        start_time = time.time()
+        expected_statuses = {
+            'attach': ['ATTACHED'],
+            'detach': ['DETACHED'],
+        }
+        while not exiting.is_set() and time.time() - start_time < 300:
+            try:
+                result = self.get_boot_volume_attachment(attachment.id) if isinstance(volume,
+                                                                                      BootVolume) \
+                    else self.get_volume_attachment(attachment.id)
+
+                if isinstance(result, Status):
+                    logger.warning(f"fail to get volume: {volume.display_name} attachment, details: {result}"
+                                   f", wait {wait_time}s")
+                    exiting.wait(wait_time)
+                    continue
+                attachment = result
+                lifecycle_state = attachment.lifecycle_state
+                if lifecycle_state not in expected_statuses[action]:
+                    logger.warning(f"waiting for volume: {volume.display_name} status, expected: "
+                                   f"{expected_statuses[action]}, actual: {lifecycle_state}, "
+                                   f"wait {wait_time}s")
+                    exiting.wait(wait_time)
+                else:
+                    return Status(http.client.OK, "Success", "Success")
+            except Exception as e:
+                self.warning(f"fail to get volume: {volume.display_name}, details: {e}, wait {wait_time}s")
+                exiting.wait(wait_time)
+                continue
+        return Status(http.client.REQUEST_TIMEOUT, "Timeout", "wait for volume status timeout")
+
+    def volume_action_task(self, **kwargs):
+        volume = kwargs.get("volume")
+        instance = kwargs.get("instance")
+        update = kwargs.get("update")
+        exiting = kwargs.get("exiting")
+        action = kwargs.get("action")
+        task = kwargs.get("task")
+        if not isinstance(volume, Volume) and not isinstance(volume, BootVolume):
+            self.warning(f'fail to start task: `{action}` volume, '
+                         f'details: volume is not an instance of Volume or BootVolume')
+            return Status(http.client.BAD_REQUEST, "InvalidVolume",
+                          "volume is not an instance of Volume or BootVolume")
+
+        result = self.detach_volume(volume=volume, instance=instance) if action == "detach" else \
+            self.attach_volume(volume=volume, instance=instance)
+
+        direction = 'to' if action == 'attach' else 'from'
+
+        if isinstance(result, Status):
+            self.notify(message=f'fail to {action} volume '
+                                f"`{escape_markdown_v2(self.name())}`\\-"
+                                f'`{escape_markdown_v2(volume.display_name)}` '
+                                f'{direction} instance: `{escape_markdown_v2(instance.display_name)}`, '
+                                f' details: `{escape_markdown_v2(str(result))}`',
+                        update=update)
+            task.fail()
+            return
+
+        result = self.wait_for_volume_status(attachment=result, volume=volume, exiting=exiting, action=action)
+        if is_failed(result):
+            self.notify(message=f'fail to {action} volume '
+                                f"`{escape_markdown_v2(self.name())}`\\-"
+                                f'`{escape_markdown_v2(volume.display_name)}` '
+                                f'{direction} instance: `{escape_markdown_v2(instance.display_name)}`, '
+                                f' details: `{escape_markdown_v2(str(result))}`',
+                        update=update)
+            task.fail()
+            return
+
+        self.notify(message=f'`{action}` volume: '
+                            f"`{escape_markdown_v2(self.name())}`\\-"
+                            f'`{escape_markdown_v2(volume.display_name)}` '
+                            f'{direction} instance: `{escape_markdown_v2(instance.display_name)}` success',
+                    update=update)
+        task.complete()
+
+    def attach_volume(self, volume: Volume | BootVolume, instance: Instance) -> VolumeAttachment | Status:
+        try:
+            return self.oci_client.attach_volume(
+                attach_volume_details=AttachParavirtualizedVolumeDetails(
+                    volume_id=volume.id,
+                    instance_id=instance.id,
+                    is_shareable=True,
+                )).data
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
+    def detach_volume(self, volume: Volume | BootVolume, instance: Instance, ) \
+            -> VolumeAttachment | BootVolumeAttachment | Status:
+        attachments = self.list_volume_attachments(instance_id=instance.id, volume_id=volume.id) \
+            if isinstance(volume, Volume) else self.list_boot_volume_attachments(
+            instance_id=instance.id, boot_volume_id=volume.id)
+
+        if isinstance(attachments, Status):
+            return attachments
+
+        attachments = [attachment for attachment in attachments if attachment.lifecycle_state == "ATTACHED"]
+
+        if len(attachments) == 0:
+            return Status(http.client.BAD_REQUEST, "NOTATTACHED", "volume not attached to instance")
+
+        # should only have one attachment
+        try:
+            action = self.oci_client.detach_boot_volume if isinstance(volume,
+                                                                      BootVolume) else self.oci_client.detach_volume
+            action(attachments[0].id)
+            return attachments[0]
+        except ServiceError as ex:
             return Status(ex.status, ex.code, ex.message)
 
     def get_boot_volume_attachment(self, boot_volume_attachment_id) -> BootVolumeAttachment | Status:
         try:
             return self.oci_client.get_boot_volume_attachment(boot_volume_attachment_id).data
-        except oci.exceptions.ServiceError as ex:
+        except ServiceError as ex:
             return Status(ex.status, ex.code, ex.message)
 
     def get_boot_volume(self, boot_volume_id) -> BootVolume | Status:
         try:
             return self.block_storage_client.get_boot_volume(boot_volume_id).data
-        except oci.exceptions.ServiceError as ex:
+        except ServiceError as ex:
             return Status(ex.status, ex.code, ex.message)
 
     def detach_boot_volume(self, boot_volume_attachment_id) -> Status:
         try:
             self.oci_client.detach_boot_volume(boot_volume_attachment_id)
             return Status(http.client.OK, "OK", "Success")
-        except oci.exceptions.ServiceError as ex:
+        except ServiceError as ex:
+            return Status(ex.status, ex.code, ex.message)
+
+    def update_boot_volume(self, boot_volume_id, display_name=None,
+                           size_in_gbs=None, vpus_per_gb=None) -> BootVolume | Status:
+        try:
+            self.block_storage_client.update_boot_volume(boot_volume_id,
+                                                         update_boot_volume_details=UpdateBootVolumeDetails(
+                                                             display_name=display_name,
+                                                             size_in_gbs=size_in_gbs,
+                                                             vpus_per_gb=vpus_per_gb))
+            return self.get_boot_volume(boot_volume_id)
+        except ServiceError as ex:
             return Status(ex.status, ex.code, ex.message)
 
     def get_namespace(self) -> str | Status:
         try:
             return self.object_storage_client.get_namespace().data
-        except oci.exceptions.ServiceError as ex:
+        except ServiceError as ex:
             return Status(ex.status, ex.code, ex.message)
 
     def create_bucket(self, bucket_name,
@@ -3279,7 +3782,7 @@ class OCIClient:
                     versioning=versioning,
                 )
             ).data
-        except oci.exceptions.ServiceError as ex:
+        except ServiceError as ex:
             return Status(ex.status, ex.code, ex.message)
 
 
@@ -3462,12 +3965,26 @@ class Task:
     def restart(self):
         return self.start()
 
-    def stop(self) -> Status:
-        if self.status in ["STOPPED", "FAILED", "COMPLETED"]:
+    def abort(self):
+        if self.status in ["ABORTED", "COMPLETED"]:
             return Status(http.client.OK, "Success", "Success")
         try:
-            self.exiting.set()
-            self.exiting.wait()
+            if not self.exiting.is_set():
+                self.exiting.set()
+                self.exiting.wait()
+            self.status = "ABORTED"
+            self.end_time = datetime.now()
+            return Status(http.client.OK, "Success", "Success")
+        except Exception as e:
+            return Status(http.client.INTERNAL_SERVER_ERROR, "AbortTaskFailed", str(e))
+
+    def stop(self) -> Status:
+        if self.status in ["STOPPED", "FAILED", "COMPLETED", "ABORTED"]:
+            return Status(http.client.OK, "Success", "Success")
+        try:
+            if not self.exiting.is_set():
+                self.exiting.set()
+                self.exiting.wait()
             self.end_time = datetime.now()
             self.status = "STOPPED"
             return Status(http.client.OK, "Success", "Success")
@@ -3499,6 +4016,73 @@ class Task:
             self.end_time = datetime.now()
 
 
+class InstanceCacheEntry:
+    __last_update__: datetime = None
+    __instances__: dict[str, Instance] = None
+
+    def __init__(self, instances: list[Instance] = None):
+        self.__last_update__ = datetime.now()
+        self.__instances__ = {}
+        self.add(instances)
+
+    @property
+    def last_update(self):
+        return self.__last_update__
+
+    @last_update.setter
+    def last_update(self, value):
+        self.__last_update__ = value
+
+    @property
+    def instances(self):
+        return self.__instances__
+
+    @instances.setter
+    def instances(self, value):
+        self.__instances__ = value
+
+    def add(self, val: Instance | list[Instance]):
+        if self.instances is None:
+            self.instances = {}
+
+        if isinstance(val, list):
+            for v in val:
+                self.add(v)
+            return
+        # keep track of both id and display_name
+        self.instances[val.id] = val
+        self.instances[val.display_name] = val
+        self.last_update = datetime.now()
+
+    def all_instances(self) -> list[Instance]:
+        if self.instances is None:
+            return []
+
+        # only return by id
+        instances = []
+        for key, value in self.instances.items():
+            if key.startswith('ocid1.instance.'):
+                instances.append(value)
+        return instances
+
+    def remove(self, instance: Instance | list[Instance]):
+        if self.instances is None:
+            return
+        if isinstance(instance, list):
+            for i in instance:
+                self.remove(i)
+            return
+        self.instances.pop(instance.id, None)
+        self.instances.pop(instance.display_name, None)
+        self.last_update = datetime.now()
+
+    def get_instance(self, key: str) -> Instance | None:
+        return self.instances.get(key)
+
+    def expire(self):
+        self.__last_update__ = datetime.min
+
+
 class TelegramCommandBot:
     __thread_pool__ = None
     __oci_clients__ = None
@@ -3513,6 +4097,8 @@ class TelegramCommandBot:
     __tasks_file__: str = os.path.join(__base_dir__, "tasks.json")
     __key_dir__: str = os.path.join(__base_dir__, "keys")
     __tasks__: dict[str, Task] = {}
+    __exiting__: threading.Event = threading.Event()
+    __instance_cache__: dict[str, InstanceCacheEntry] = {}
 
     @property
     def thread_pool(self):
@@ -3619,6 +4205,14 @@ class TelegramCommandBot:
         self.__config_file__ = value
 
     @property
+    def instance_cache(self):
+        return self.__instance_cache__
+
+    @property
+    def exiting(self):
+        return self.__exiting__
+
+    @property
     def tasks_file(self):
         return self.__tasks_file__
 
@@ -3651,9 +4245,14 @@ class TelegramCommandBot:
 
                 # again unique by oci_profile and command
                 seen = set()
-                to_save = [x for x in to_save if x['status'] in ['RUNNING', 'STOPPED']
-                           and f"{x['oci_profile']}_{x['command']}" not in seen
-                           and not seen.add(f"{x['oci_profile']}_{x['command']}")]
+
+                for task in to_save:
+                    key = f"{task['oci_profile']}_{task['command']}"
+                    if task['status'] in ['RUNNING', 'STOPPED', 'FAILED'] and key in seen:
+                        logger.debug(f"found duplicated task: {task['id']} with command: {task['command']}, abort...")
+                        task['status'] = 'ABORTED'  # abort duplicated task
+                    else:
+                        seen.add(key)
 
         with open(self.tasks_file, "w") as sf:
             json.dump(to_save, sf, indent=2)
@@ -3769,7 +4368,7 @@ class TelegramCommandBot:
                 for task_dict in task_dicts:
                     task_status = task_dict.get("status")
                     task_id = task_dict.get("id")
-                    if task_status not in ["RUNNING", "STOPPED"]:
+                    if task_status not in ["RUNNING", "STOPPED", "FAILED"]:
                         logger.debug(f"skip task: {task_id} with status: {task_status}")
                         continue
                     task_name = task_dict.get("name")
@@ -3803,6 +4402,20 @@ class TelegramCommandBot:
             return "🏴"
         return flag(self.oci_client(oci_profile).oci_config.region)
 
+    def city(self, oci_profile):
+        if oci_profile not in self.oci_clients.keys():
+            return "Unknown"
+        return city(self.oci_client(oci_profile).oci_config.region)
+
+    def flagged_city(self, oci_profile):
+        return f'{self.flag(oci_profile)} {self.city(oci_profile)}'
+
+    def in_country(self, oci_profile, country_code) -> bool:
+        if oci_profile not in self.oci_clients:
+            return False
+        oci_region = oci_regions.get(self.oci_client(oci_profile).oci_config.region)
+        return in_country(oci_region, country_code)
+
     def start(self):
         logger.info("starting telegram bot...")
         persistence = PicklePersistence(filepath=os.path.join(__base_dir__, ".bot"))
@@ -3816,6 +4429,7 @@ class TelegramCommandBot:
                 INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT, self.input_private_key_handler)],
                 PASSPHRASE_REQUIRED: [MessageHandler(filters.TEXT, self.input_passphrase_handler)],
                 DONE: [MessageHandler(filters.ALL, self.done_add_profile)],
+                ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, self.done_add_profile)],
             },
             fallbacks=[CommandHandler("cancel", self.done_add_profile)],
             name="add_profile",
@@ -3825,19 +4439,32 @@ class TelegramCommandBot:
 
         # on different commands - answer in Telegram
         self.telegram_bot.add_handler(TypeHandler(Update, self.permission_handler), group=-1)
+        self.telegram_bot.add_handler(CommandHandler("tenancy", self.tenancy_handler))
         self.telegram_bot.add_handler(CommandHandler("instances", self.list_instances_handler))
         self.telegram_bot.add_handler(CommandHandler("profiles", self.list_profiles_handler))
+        self.telegram_bot.add_handler(CommandHandler("delete_profiles", self.delete_profiles_handler))
+        self.telegram_bot.add_handler(CommandHandler("volumes", self.list_volumes_handler))
+        self.telegram_bot.add_handler(CommandHandler("attach_volume", self.volume_action_handler))
+        self.telegram_bot.add_handler(CommandHandler("detach_volume", self.volume_action_handler))
         self.telegram_bot.add_handler(add_profile_handler)
         self.telegram_bot.add_handler(CommandHandler("change_ip", self.change_ip_handler))
+        self.telegram_bot.add_handler(CommandHandler("allow_ports", self.add_security_rules_handler))
+        self.telegram_bot.add_handler(CommandHandler("clear_security_lists", self.clear_security_rules_handler))
         self.telegram_bot.add_handler(CommandHandler("delete_ipv6s", self.delete_ipv6_handler))
         self.telegram_bot.add_handler(CommandHandler("dns_records", self.dns_records_handler))
         self.telegram_bot.add_handler(CommandHandler("cf_records", self.cf_records_handler))
+        self.telegram_bot.add_handler(CommandHandler("add_cf_record", self.create_cf_record_handler))
         self.telegram_bot.add_handler(CommandHandler("create_cf_record", self.create_cf_record_handler))
         self.telegram_bot.add_handler(CommandHandler("update_cf_record", self.update_cf_record_handler))
         self.telegram_bot.add_handler(CommandHandler("delete_cf_records", self.delete_cf_record_handler))
         self.telegram_bot.add_handler(CommandHandler("rename_instance", self.rename_instance_handler))
         self.telegram_bot.add_handler(CommandHandler("create_instance", self.create_instance_handler))
         self.telegram_bot.add_handler(CommandHandler("resize_instance", self.resize_instance_handler))
+        self.telegram_bot.add_handler(CommandHandler("create_console_connection",
+                                                     self.create_console_connection_handler))
+        self.telegram_bot.add_handler(CommandHandler("console_connections",
+                                                     self.get_console_connection_handler))
+        self.telegram_bot.add_handler(CommandHandler("resize_boot_volume", self.resize_boot_volume_handler))
         self.telegram_bot.add_handler(CommandHandler("delete_instance", self.delete_instance_handler))
         self.telegram_bot.add_handler(CommandHandler("start_instance", self.start_instance_handler))
         self.telegram_bot.add_handler(CommandHandler("instance_action", self.instance_action_handler))
@@ -3846,6 +4473,8 @@ class TelegramCommandBot:
         self.telegram_bot.add_handler(CommandHandler("ping", self.ping_handler))
         self.telegram_bot.add_handler(CommandHandler("tasks", self.list_tasks_handler))
         self.telegram_bot.add_handler(CommandHandler("pause_task", self.pause_task_handler))
+        self.telegram_bot.add_handler(CommandHandler("abort_task", self.abort_task_handler))
+        self.telegram_bot.add_handler(CommandHandler("abandon_task", self.abort_task_handler))
         self.telegram_bot.add_handler(CommandHandler("start_task", self.start_task_handler))
         self.telegram_bot.add_handler(CommandHandler("sysinfo", self.sys_info_handler))
         self.telegram_bot.add_handler(CommandHandler("alive", self.alive_check_handler))
@@ -3862,6 +4491,8 @@ class TelegramCommandBot:
             logger.error(f"fail to start telegram bot, details: {e}")
 
         logger.info(f'Received Ctrl+C. Shutting down gracefully...')
+        # stop all threads and tasks
+        self.exiting.set()
         # stop all running tasks
         for task in self.tasks.values():
             result = task.stop()
@@ -3876,18 +4507,72 @@ class TelegramCommandBot:
     def profile_tasks(self, profile_name):
         return [task for task in self.tasks.values() if task.oci_profile == profile_name and task.status == "RUNNING"]
 
-    async def list_instances(self, profile_name):
+    def profile_instances(self, profile_name, use_cache=True):
+        if profile_name in self.instance_cache and use_cache:
+            cached = self.instance_cache.get(profile_name)
+            if (datetime.now() - cached.last_update).seconds <= 300:
+                return cached.all_instances()
+        oci_client = self.oci_client(profile_name)
+        if oci_client is None:
+            return profile_name, Status(http.client.BAD_REQUEST,
+                                        "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        instances = oci_client.list_instances()
+        if isinstance(instances, Status):
+            return instances
+        # update cache
+        self.instance_cache[profile_name] = InstanceCacheEntry(instances)
+        return instances
+
+    async def list_instances(self, profile_name, use_cache=True):
+        return profile_name, self.profile_instances(profile_name, use_cache)
+
+    async def list_volumes(self, profile_name, instance_id=None):
         oci_client = self.oci_clients.get(profile_name)
         if oci_client is None:
             return profile_name, Status(http.client.BAD_REQUEST,
                                         "NoOCIProfile", f"OCI Profile not found: {profile_name}")
-        return profile_name, oci_client.list_instances()
+        return profile_name, oci_client.list_volumes(instance_id=instance_id)
 
-    def get_instance(self, profile_name, instance_name) -> Instance | Status:
+    async def list_boot_volumes(self, profile_name, instance_id=None):
         oci_client = self.oci_clients.get(profile_name)
         if oci_client is None:
-            return Status(http.client.BAD_REQUEST, "NoOCIProfile", f"OCI Profile not found: {profile_name}")
-        instances = oci_client.list_instances()
+            return profile_name, Status(http.client.BAD_REQUEST,
+                                        "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+
+        return profile_name, oci_client.list_boot_volumes(instance_id=instance_id)
+
+    async def volumes(self, profile_name, instance_id=None):
+        result = await self.list_volumes(profile_name, instance_id)
+        if isinstance(result, Status):
+            return result
+        _, volumes = result
+        result = await self.list_boot_volumes(profile_name, instance_id)
+        if isinstance(result, Status):
+            return volumes
+
+        _, boot_volumes = result
+        return volumes + boot_volumes
+
+    async def get_volumes(self, profile_name, volume_name) -> list[Volume] | Status:
+        result = await self.list_volumes(profile_name)
+        if isinstance(result, Status):
+            return result
+
+        _, volumes = result
+        return [volume for volume in volumes if volume.display_name.upper() == volume_name.upper()]
+
+    async def get_volume(self, profile_name, volume_name) -> Volume | Status:
+        result = await self.get_volumes(profile_name, volume_name)
+        if isinstance(result, Status):
+            return result
+
+        if len(result) == 0:
+            return Status(http.client.BAD_REQUEST, "NoVolumeFound", f"volume {volume_name} not found")
+
+        return result[0]
+
+    def get_instance(self, profile_name, instance_name) -> Instance | Status:
+        instances = self.profile_instances(profile_name)
         if isinstance(instances, Status):
             return instances
         for instance in instances:
@@ -3897,15 +4582,24 @@ class TelegramCommandBot:
         return Status(http.client.BAD_REQUEST, "NoOCIInstance",
                       f"instance {instance_name} not found in profile {profile_name}")
 
+    async def tenancy(self, profile_name):
+        oci_client = self.oci_clients.get(profile_name)
+        if oci_client is None:
+            return profile_name, Status(http.client.BAD_REQUEST,
+                                        "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        return profile_name, oci_client.get_tenancy()
+
     async def live_check(self, profile_name):
         oci_client = self.oci_clients.get(profile_name)
         if oci_client is None:
             return profile_name, '👻Not Found'
         try:
-            tenancy = oci_client.get_tenancy()
-            if isinstance(tenancy, Status):
-                logger.warning(f"fail to get tenancy for profile {profile_name}, details: {tenancy}")
-                if tenancy.code == http.client.UNAUTHORIZED:
+            profile_name = f'{self.flagged_city(profile_name)} - {profile_name}'
+            result = oci_client.list_instances()
+            if isinstance(result, Status):
+                logger.warning(f"fail to get instances for profile {profile_name}, details: {result}")
+                if ((result.status == http.client.NOT_FOUND and result.code == 'NotAuthorizedOrNotFound') or
+                        (result.status == http.client.UNAUTHORIZED and result.code == 'NotAuthenticated')):
                     return profile_name, '💀Dead'
                 return profile_name, '☢️Danger'
             return profile_name, '👍Alive'
@@ -3924,11 +4618,12 @@ class TelegramCommandBot:
         if len(profiles) == 0:
             profiles = self.oci_clients.keys()
         result = await self.alive_check(profiles=profiles)
+        result = sorted(result, key=lambda x: x[0])
         message = f"*OCI Profile Status*:\n"
         adjusted = max([len(profile_name) for profile_name, _ in result]) + 2
         message += "```bash\n"
         for profile_name, status in result:
-            message += f"{self.flag(profile_name)}{profile_name.ljust(adjusted)}: {status}\n"
+            message += f"{profile_name.ljust(adjusted)}: {status}\n"
         message += "```"
         await update.message.reply_markdown_v2(text=message,
                                                reply_to_message_id=update.message.message_id)
@@ -4006,6 +4701,36 @@ class TelegramCommandBot:
         await update.message.reply_markdown_v2(text=message,
                                                reply_to_message_id=update.message.message_id)
 
+    async def abort_task_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if len(context.args) == 0:
+            await update.message.reply_markdown_v2(text=f"task id is required",
+                                                   reply_to_message_id=update.message.message_id)
+            return
+
+        task_id = context.args[0]
+        task = self.tasks.get(task_id)
+        if task is None:
+            await update.message.reply_markdown_v2(text=f"task not found: {escape_markdown_v2(task_id)}",
+                                                   reply_to_message_id=update.message.message_id)
+            return
+
+        if task.status in ["ABORTED", "COMPLETED"]:
+            await update.message.reply_markdown_v2(text=f"task is already `completed` or `aborted`: "
+                                                        f"`{escape_markdown_v2(task_id)}`",
+                                                   reply_to_message_id=update.message.message_id)
+            return
+
+        result = task.abort()
+
+        if is_failed(result):
+            await update.message.reply_markdown_v2(text=f"fail to abort task: `{escape_markdown_v2(task_id)}`, "
+                                                        f"details: {escape_markdown_v2(str(result))}",
+                                                   reply_to_message_id=update.message.message_id)
+            return
+
+        await update.message.reply_markdown_v2(text=f"task aborted: `{escape_markdown_v2(task_id)}`",
+                                               reply_to_message_id=update.message.message_id)
+
     async def pause_task_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if len(context.args) == 0:
             await update.message.reply_markdown_v2(text=f"task id is required",
@@ -4068,13 +4793,53 @@ class TelegramCommandBot:
         oci_profiles = self.oci_clients.keys()
         message = f"*profile list*:\n"
         profiles = []
+        flagged_city_adjust = max([len(self.city(oci_profile)) for oci_profile in oci_profiles]) + 2
+        tenancy_adjust = max([len(oci_profile) for oci_profile in oci_profiles]) + 2
         for oci_profile in oci_profiles:
-            profile_text = f'`{escape_markdown_v2(oci_profile)}`'
-            profiles.append(f"{self.flag(oci_profile)} {profile_text}")
+            country_flag = self.flag(oci_profile)
+            city_text = f'{self.city(oci_profile)}'
+            tenancy_text = f'{escape_markdown_v2(oci_profile)}'
+            spaces = " " * (flagged_city_adjust - len(city_text))
+            profiles.append(f'''{country_flag}`{city_text}``{spaces}`: `{tenancy_text.rjust(tenancy_adjust)}`''')
         sorted_profiles = sorted(profiles)
         message += "\n".join(sorted_profiles)
         await update.message.reply_markdown_v2(text=message,
                                                reply_to_message_id=update.message.message_id)
+
+    async def delete_profiles_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if len(context.args) == 0:
+            await update.message.reply_markdown_v2(
+                text=f'profile(s) name is(are) required, please input the profile name(s) to delete',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        profiles = context.args
+
+        for profile in profiles:
+            if profile not in self.oci_clients.keys():
+                await update.message.reply_markdown_v2(
+                    text=f'profile `{escape_markdown_v2(profile)}` not found',
+                    reply_to_message_id=update.message.message_id)
+                continue
+            # abort all running tasks
+            tasks = self.profile_tasks(profile)
+            for task in tasks:
+                task.abort()
+            # delete oci client
+            oci_client = self.oci_clients.get(profile)
+            if oci_client is not None:
+                private_key_file = oci_client.oci_config.key_file
+                if private_key_file is not None:
+                    # delete the private key file
+                    os.remove(private_key_file)
+            # delete oci config
+            del self.oci_clients[profile]
+            self.save_oci_config()
+            message = f'profile `{escape_markdown_v2(profile)}` deleted'
+            if len(tasks) > 0:
+                message += f', {len(tasks)} tasks aborted'
+            await update.message.reply_markdown_v2(text=message,
+                                                   reply_to_message_id=update.message.message_id)
 
     @staticmethod
     async def start_add_profile_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4083,7 +4848,7 @@ class TelegramCommandBot:
         message = f'Hello, [@{user_name}](tg://user?id={user_id})\n' \
                   f'please input the profile details in the following format' \
                   f'\\(remove the `key_file=xxx` when you copy from OCI Console\\):\n' \
-                  f'```text\n' \
+                  f'```bash\n' \
                   f'[profile_name]\n' \
                   f'{escape_markdown_v2("user = <user_ocid>")}\n' \
                   f'{escape_markdown_v2("fingerprint = <fingerprint>")}\n' \
@@ -4093,8 +4858,14 @@ class TelegramCommandBot:
         await update.message.reply_markdown_v2(text=message, reply_to_message_id=update.message.message_id)
         return INPUT_PROFILE_DETAILS
 
-    @staticmethod
-    async def input_profile_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    async def to_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user_input = update.message.text.strip()
+        if user_input.lower() == '/cancel':
+            await self.done_add_profile(update, context)
+            raise ApplicationHandlerStop(DONE)
+
+    async def input_profile_info_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.to_cancel(update=update, context=context)
         user_input = update.message.text.strip()
         if not user_input.startswith('[') and ']' not in user_input:
             user_input = f"[{str(uuid.uuid4())}]\n{user_input}"
@@ -4150,7 +4921,7 @@ class TelegramCommandBot:
         context.user_data['profile_message_id'] = update.message.message_id
         context.user_data['private_key'] = None
         message = f'please input the private key file content in the following format:\n' \
-                  f'```text\n' \
+                  f'```bash\n' \
                   f'-----BEGIN PRIVATE KEY-----\n' \
                   f'...\n' \
                   f'-----END PRIVATE KEY-----\n' \
@@ -4312,6 +5083,7 @@ class TelegramCommandBot:
         return DONE
 
     async def input_private_key_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.to_cancel(update=update, context=context)
         key_text = update.message.text.strip()
         if (not (key_text.startswith('-----BEGIN PRIVATE KEY-----') and
                  key_text.endswith('-----END PRIVATE KEY-----')) and
@@ -4331,18 +5103,55 @@ class TelegramCommandBot:
         return await self.add_profile(update, context)
 
     async def input_passphrase_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.to_cancel(update=update, context=context)
         result = await self.validate_key(update, context, step=PASSPHRASE_REQUIRED)
         if result in [INPUT_PRIVATE_KEY, PASSPHRASE_REQUIRED]:
             return result
 
         return await self.add_profile(update, context)
 
+    async def tenancy_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        profiles = context.args if len(context.args) > 0 else self.oci_clients.keys()
+        tasks = [self.tenancy(profile) for profile in profiles]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        message = f"*Tenancy*:\n"
+        for result in results:
+            profile_name, tenancy = result
+            message += f"{self.flag(profile_name)} `{profile_name}`:\n"
+            if isinstance(tenancy, Status):
+                message += f"  •  fail to get tenancy: `{escape_markdown_v2(str(result))}`\n"
+                continue
+            message += f"```bash\n"
+            message += f"  •  id: {tenancy.id}\n"
+            message += f"  •  name: {tenancy.name}\n"
+            message += f"  •  home region: {tenancy.home_region_key}\n"
+            message += f"```\n"
+        await update.message.reply_markdown_v2(text=message, reply_to_message_id=update.message.message_id)
+
     async def list_instances_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         oci_profiles = context.args
+        not_found = []
         if oci_profiles is None or len(oci_profiles) == 0:
             oci_profiles = self.oci_clients.keys()
+        else:
+            not_found = [oci_profile for oci_profile in oci_profiles if oci_profile not
+                         in self.oci_clients.keys() and not is_country_code(oci_profile)]
 
-        not_found = [oci_profile for oci_profile in oci_profiles if oci_profile not in self.oci_clients.keys()]
+            countries = [oci_profile for oci_profile in oci_profiles if is_country_code(oci_profile)]
+
+            if len(countries) > 0:
+                for country in countries:
+                    oci_profiles.remove(country)
+                    profiles = [oci_profile for oci_profile in
+                                self.oci_clients.keys() if self.in_country(oci_profile, country)]
+                    if len(profiles) > 0:
+                        oci_profiles.extend(profiles)
+                    else:
+                        not_found.append(country)
+
+            # remove all duplicates
+            oci_profiles = list(set(oci_profiles))
 
         if len(not_found) > 0:
             await update.message.reply_markdown_v2(
@@ -4353,56 +5162,230 @@ class TelegramCommandBot:
 
         tasks = [self.list_instances(oci_profile) for oci_profile in oci_profiles]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        message = f"Instances:\n"
-        for result in results:
-            oci_profile, instances = result
-            oci_client = self.oci_clients.get(oci_profile)
-            message += f"{self.flag(oci_profile)} *{escape_markdown_v2(oci_profile)}*\n"
-            if isinstance(instances, Status):
-                message += f"  •  fail to load instances {escape_markdown_v2(str(instances))}\n"
+        # sort result by flag order
+        results = sorted(results, key=lambda x: f'{self.flagged_city(x[0])}{x[0]}')
+        # group results by 5
+        for i in range(0, len(results), 5):
+            current_results = results[i:i + 5 if i + 5 < len(results) else len(results)]
+            message = f"Instances:\n"
+            for result in current_results:
+                oci_profile, instances = result
+                oci_client = self.oci_clients.get(oci_profile)
+                message += f"*`{self.flagged_city(oci_profile)} \\- {escape_markdown_v2(oci_profile)}`*\n"
+                if isinstance(instances, Status):
+                    message += f"  •  fail to load instances: `{escape_markdown_v2(str(instances))}`\n"
+                    continue
 
-            profile_tasks = self.profile_tasks(oci_profile)
+                profile_tasks = self.profile_tasks(oci_profile)
 
-            if len(instances) == 0:
-                message += "no instance found, use `/create_instance` to create one\n"
+                if len(instances) == 0:
+                    message += "no instance found, use `/create_instance` to create one\n"
+                    if profile_tasks is not None and len(profile_tasks) > 0:
+                        message += "🤖running tasks:\n"
+                        for task in profile_tasks:
+                            message += f"🏃`{escape_markdown_v2(task.command)}`\n"
+                    continue
+
+                status_emojis = {
+                    'RUNNING': '✅',
+                    'STARTING': '⌛',
+                    'STOPPING': '🛑',
+                    'STOPPED': '🛑',
+                    'TERMINATING': '❌',
+                    'TERMINATED': '❌',
+                    'PROVISIONING': '⌛️',
+                    'CREATING_IMAGE': '⌛',
+                }
+
+                message += "```bash\n"
+                for instance in instances:
+                    status = instance.lifecycle_state
+                    if status in ['TERMINATED', 'TERMINATING']:
+                        continue
+                    name = instance.display_name
+                    icon = status_emojis[status]
+                    primary_ip_v4 = oci_client.get_primary_ipv4(instance.id)
+                    cpu_cores = int(instance.shape_config.ocpus)
+                    memory_in_gbs = int(instance.shape_config.memory_in_gbs)
+                    shap_config = f"{cpu_cores}C{memory_in_gbs}G"
+                    status_text = f"{icon}{status}{icon}"
+                    created_at = instance.time_created.strftime("%Y-%m-%d")
+                    message += f"{name:10s} {shap_config:10s} ({primary_ip_v4:15s}) {created_at} {status_text:10s}\n"
+
+                message += "```\n"
                 if profile_tasks is not None and len(profile_tasks) > 0:
                     message += "🤖running tasks:\n"
                     for task in profile_tasks:
                         message += f"🏃`{escape_markdown_v2(task.command)}`\n"
+            await update.message.reply_markdown_v2(text=message, reply_to_message_id=update.message.message_id)
+
+    async def volume_action_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        action = update.message.text.strip().split(" ")[0].lower()
+        action = action.replace("/", "").replace("_volume", "")
+        if len(context.args) < 3:
+            await update.message.reply_markdown_v2(
+                text=f"parameter error: `/{action}_volume <profile> <instance_name> <volume_name>`",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        profile_name = context.args[0]
+        instance_name = context.args[1]
+        volume_name = context.args[2]
+
+        instance = self.get_instance(profile_name, instance_name)
+        if isinstance(instance, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to get instance `{escape_markdown_v2(instance_name)}`, '
+                     f'details: `{escape_markdown_v2(str(instance))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        if instance.lifecycle_state not in ['RUNNING', 'STOPPED']:
+            await update.message.reply_markdown_v2(
+                text=f'instance `{escape_markdown_v2(instance_name)}` is not running or stopped, '
+                     f'can not attach volume',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        volume = await self.get_volume(profile_name, volume_name)
+
+        if isinstance(volume, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to get volume `{escape_markdown_v2(volume_name)}`, '
+                     f'details: `{escape_markdown_v2(str(volume))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        result = self.submit(oci_profile=profile_name, fn='volume_action_task',
+                             instance=instance, volume=volume, action=action, update=update)
+        if isinstance(result, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to submit task for instance `{escape_markdown_v2(instance_name)}` '
+                     f'to `{action}` volume `{escape_markdown_v2(volume_name)}`, '
+                     f'details: `{escape_markdown_v2(str(result))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        await update.message.reply_markdown_v2(
+            text=f'task submitted for instance `{escape_markdown_v2(instance_name)}` '
+                 f'to `{action}` volume `{escape_markdown_v2(volume_name)}`, '
+                 f'task id: `{escape_markdown_v2(result.id)}`',
+            reply_to_message_id=update.message.message_id)
+
+    async def list_volumes_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        profiles = context.args
+        if profiles is None or len(profiles) == 0:
+            profiles = self.oci_clients.keys()
+
+        not_found = [profile for profile in profiles if profile not in self.oci_clients.keys()]
+        if not_found is not None and len(not_found) > 0:
+            await update.message.reply_markdown_v2(
+                text=f"profile not found: {markdown_list(not_found)}",
+                reply_to_message_id=update.message.message_id)
+
+        if len(not_found) == len(profiles):
+            return
+
+        tasks = [self.list_volumes(profile) for profile in profiles]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        message = f"Volumes:\n"
+        for profile, result in results:
+            message += f"{self.flag(profile)} *{escape_markdown_v2(profile)}*\n"
+            if isinstance(result, Status):
+                message += f"  •  fail to load volumes {escape_markdown_v2(str(result))}\n"
                 continue
 
-            status_emojis = {
-                'RUNNING': '✅',
-                'STARTING': '⌛',
-                'STOPPING': '🛑',
-                'STOPPED': '🛑',
-                'TERMINATING': '❌',
-                'TERMINATED': '❌',
-                'PROVISIONING': '⌛️',
-                'CREATING_IMAGE': '⌛',
-            }
-
-            message += "```text\n"
-            for instance in instances:
-                status = instance.lifecycle_state
-                if status in ['TERMINATED', 'TERMINATING']:
-                    continue
-                name = instance.display_name
-                icon = status_emojis[status]
-                primary_ip_v4 = oci_client.get_primary_ipv4(instance.id)
-                cpu_cores = int(instance.shape_config.ocpus)
-                memory_in_gbs = int(instance.shape_config.memory_in_gbs)
-                shap_config = f"{cpu_cores}C{memory_in_gbs}G"
-                status_text = f"{icon}{status}{icon}"
-                created_at = instance.time_created.strftime("%Y-%m-%d")
-                message += f"{name:10s} {shap_config:10s} ({primary_ip_v4:15s}) {created_at} {status_text:10s}\n"
-
+            volumes = result
+            if len(volumes) == 0:
+                message += "  •  no volume found\n"
+                continue
+            message += "```bash\n"
+            name_adjust = max([len(volume.display_name) for volume in volumes]) + 2
+            size_adjust = max([len(readable_size(volume.size_in_mbs, base_unit='MB')) for volume in volumes]) + 2
+            for volume in volumes:
+                name = volume.display_name
+                size_readable = readable_size(volume.size_in_mbs, base_unit='MB')
+                message += f"{name.ljust(name_adjust)} {size_readable.rjust(size_adjust)}\n"
             message += "```\n"
-            if profile_tasks is not None and len(profile_tasks) > 0:
-                message += "🤖running tasks:\n"
-                for task in profile_tasks:
-                    message += f"🏃`{escape_markdown_v2(task.command)}`\n"
-        await update.message.reply_markdown_v2(text=message, reply_to_message_id=update.message.message_id)
+            await update.message.reply_markdown_v2(text=message, reply_to_message_id=update.message.message_id)
+
+    async def resize_boot_volume_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if context.args is None or len(context.args) < 3:
+            await update.message.reply_markdown_v2(
+                text=f"parameter error: `/resize_boot_volume <profile> <instance_name> <size_in_gbs>`",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        profile_name = context.args[0]
+        instance_name = context.args[1]
+        size_in_gbs = context.args[2].Upper()
+        size_in_gbs = size_in_gbs.replace("GB", "").replace("G", "")  # remove GB or G
+
+        if not size_in_gbs.isdigit():
+            await update.message.reply_markdown_v2(
+                text=f"size_in_gbs should be a number",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        size_in_gbs = int(size_in_gbs)
+        vpus_per_gb = None
+        if len(context.args) > 3:
+            vpus_per_gb = int(context.args[3])
+            if vpus_per_gb < 10 or vpus_per_gb > 120 or not vpus_per_gb % 10 == 0:
+                await update.message.reply_markdown_v2(
+                    text=f"vpus_per_gb should be between 10 and 120 and multiple of 10",
+                    reply_to_message_id=update.message.message_id)
+                return
+
+        instance = self.get_instance(profile_name, instance_name)
+        if isinstance(instance, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to get instance `{escape_markdown_v2(instance_name)}`, '
+                     f'details: `{escape_markdown_v2(str(instance))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        if instance.lifecycle_state not in ['RUNNING', 'STOPPED']:
+            await update.message.reply_markdown_v2(
+                text=f'instance `{escape_markdown_v2(instance_name)}` is not running or stopped, '
+                     f'can not resize boot volume',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        oci_client = self.oci_client(profile_name)
+
+        boot_volumes = oci_client.list_boot_volumes(instance.id)
+        if isinstance(boot_volumes, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to get boot volume for instance `{escape_markdown_v2(instance_name)}`, '
+                     f'details: `{escape_markdown_v2(str(boot_volumes))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        # should only have one boot volume
+        boot_volume = boot_volumes[0]
+
+        current_size_in_gbs = int(boot_volume.size_in_gbs)
+        if current_size_in_gbs >= size_in_gbs:
+            await update.message.reply_markdown_v2(
+                text=f'new `size_in_gbs` should be larger than current size: '
+                     f'{escape_markdown_v2(current_size_in_gbs)}GB',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        result = oci_client.update_boot_volume(boot_volume.id, size_in_gbs=size_in_gbs, vpus_per_gb=vpus_per_gb)
+        if isinstance(result, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to update boot volume for instance `{escape_markdown_v2(instance_name)}`, '
+                     f'details: `{escape_markdown_v2(str(result))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+        await update.message.reply_markdown_v2(
+            text=f'boot volume for instance `{escape_markdown_v2(instance_name)}` is updating, '
+                 f'please wait',
+            reply_to_message_id=update.message.message_id)
 
     async def resize_instance_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
@@ -4509,7 +5492,7 @@ class TelegramCommandBot:
                 reply_to_message_id=update.message.message_id)
             return
 
-        instances = self.list_instances(oci_profile)
+        _, instances = await self.list_instances(oci_profile)
 
         if isinstance(instances, Status):
             await update.message.reply_markdown_v2(
@@ -4561,6 +5544,183 @@ class TelegramCommandBot:
             reply_to_message_id=update.message.message_id)
 
     @staticmethod
+    async def instance_console_connection(oci_client: OCIClient, instance: Instance):
+        return instance, oci_client.instance_console_connection(instance)
+
+    async def get_console_connection_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if context.args is None or len(context.args) < 1:
+            await update.message.reply_markdown_v2(
+                text=f"parameter error: `/console_connections <profile> [instance_name]`",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        oci_profile = context.args[0]
+        instance_names = context.args[1:]
+
+        oci_client = self.oci_client(oci_profile)
+        if oci_client is None:
+            await update.message.reply_markdown_v2(
+                text=f"OCI profile `{escape_markdown_v2(oci_profile)}` not found",
+                reply_to_message_id=update.message.message_id)
+            return
+        instances = oci_client.list_instances()
+        if isinstance(instances, Status):
+            await update.message.reply_markdown_v2(
+                text=f"fail to list instances, details: `{escape_markdown_v2(str(instances))}`",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        if len(instances) == 0:
+            await update.message.reply_markdown_v2(
+                text=f"no instance found",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        if len(instance_names) > 0:
+            instances = list(cytoolz.filter(lambda i: i.display_name in instance_names, instances))
+
+        if len(instances) == 0:
+            await update.message.reply_markdown_v2(
+                text=f"no instance found",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        tasks = [self.instance_console_connection(oci_client, instance) for instance in instances]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        message = f"Console Connections:\n"
+        for result in results:
+            instance, console_connection = result
+            if isinstance(console_connection, Status):
+                message += (f"❌ `{escape_markdown_v2(instance.display_name)}`: "
+                            f"`{escape_markdown_v2(str(console_connection.message))}`\n")
+            else:
+                message += f"✅ `{escape_markdown_v2(instance.display_name)}`\n"
+                message += f"    🔗SSH for `macOS/Linux`\n"
+                message += f"```bash\n"
+                message += f"{escape_markdown_v2(console_connection.connection_string)}\n"
+                message += "```\n"
+                message += f"    🔗VNC connection for `macOS/Linux`\n"
+                message += f"```bash\n"
+                message += f"{escape_markdown_v2(console_connection.vnc_connection_string)}\n"
+                message += "```\n"
+
+        await update.message.reply_markdown_v2(text=message, reply_to_message_id=update.message.message_id)
+
+    async def create_console_connection_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if context.args is None or len(context.args) < 2:
+            await update.message.reply_markdown_v2(
+                text=f"parameter error: `/create_console_connection <profile> <instance_name>`",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        use_master_ssh_key = False
+        if len(context.args) > 2:
+            use_master_ssh_key = context.args[2].lower() in ["use_master_ssh_key", "true"]
+
+        oci_profile = context.args[0]
+        instance_name = context.args[1]
+
+        instance = self.get_instance(oci_profile, instance_name)
+        if isinstance(instance, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to get instance `{escape_markdown_v2(instance_name)}`, '
+                     f'details: `{escape_markdown_v2(str(instance))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        if instance.lifecycle_state in ["TERMINATED", "TERMINATING"]:
+            await update.message.reply_markdown_v2(
+                text=f'instance `{escape_markdown_v2(instance_name)}` is terminated or terminating',
+                reply_to_message_id=update.message.message_id)
+
+        ssh_key = None
+        public_key = self.master_ssh_authorize_keys
+        if not use_master_ssh_key or public_key is None:
+            ssh_key = generate_ssh_key()
+            public_key = ssh_key.public_key
+
+        oci_client = self.oci_client(oci_profile)
+        # try to delete the console connection and create a new one
+        result = oci_client.delete_instance_console_connections(instance=instance)
+        if is_failed(result):
+            await update.message.reply_markdown_v2(
+                text=f'fail to delete console connection for instance `{escape_markdown_v2(instance_name)}`, '
+                     f'details: `{escape_markdown_v2(str(result))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+        if len(result) > 0:
+            await update.message.reply_markdown_v2(
+                text=f'console connection for instance `{escape_markdown_v2(instance_name)}` is deleting, '
+                     f'please wait for a while',
+                reply_to_message_id=update.message.message_id)
+
+            async def wait_task(conn: ConsoleConnection):
+                r = oci_client.wait_for_console_connection(instance=instance,
+                                                           console_connection=conn,
+                                                           exiting=self.exiting,
+                                                           expected_lifecycle_state="DELETED")
+                if isinstance(r, Status):
+                    await update.message.reply_markdown_v2(
+                        text=f'fail to wait for console connection to be deleted, '
+                             f'details: `{escape_markdown_v2(str(r))}`',
+                        reply_to_message_id=update.message.message_id)
+                    return False
+                return True
+
+            tasks = [wait_task(conn) for conn in result]
+
+            wait_result = await asyncio.gather(*tasks)
+            if not all(wait_result):
+                await update.message.reply_markdown_v2(
+                    text=f'fail to wait for console connections to be deleted',
+                    reply_to_message_id=update.message.message_id)
+                return
+        result = oci_client.create_console_connection(instance_id=instance.id, public_key=public_key)
+        if isinstance(result, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to create console connection for instance `{escape_markdown_v2(instance_name)}`, '
+                     f'details: `{escape_markdown_v2(str(result))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        connection = result
+        text = (f"console connection for instance `{escape_markdown_v2(instance_name)}` "
+                f"created, please wait for a while\n")
+        message = await update.message.reply_markdown_v2(text=text, reply_to_message_id=update.message.message_id)
+
+        # wait for console connection to be ready
+        result = oci_client.wait_for_console_connection(instance=instance,
+                                                        console_connection=connection,
+                                                        exiting=self.exiting)
+        if isinstance(result, Status):
+            await message.edit_text("fail to wait for console connection to be ready, "
+                                    f"details: `{escape_markdown_v2(str(result))}`", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        console_connection = result
+        text = (f"console connection for instance `{escape_markdown_v2(instance_name)}` "
+                f"created, connection is ready, use the following commands to connect:\n"
+                f"    🔗SSH for `macOS/Linux`\n"
+                f"```bash\n"
+                f"{escape_markdown_v2(console_connection.connection_string)}\n"
+                "```\n"
+                f"    🔗VNC connection for `macOS/Linux`\n"
+                f"```bash\n"
+                f"{escape_markdown_v2(console_connection.vnc_connection_string)}\n"
+                "```\n")
+        await message.edit_text(text=text, parse_mode=ParseMode.MARKDOWN_V2)
+        if ssh_key is not None:
+            private_key_path = ssh_key.save()
+            if private_key_path is not None:
+                await message.reply_document(document=open(private_key_path, 'rb'),
+                                             filename=f"{instance_name}.pem",
+                                             parse_mode=ParseMode.MARKDOWN_V2,
+                                             caption=f"private key for console connection of instance `{instance_name}`"
+                                                     f", passphrase is `{escape_markdown_v2(ssh_key.passphrase)}`")
+                os.remove(private_key_path)
+
+    @staticmethod
     async def ping_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if context.args is None or len(context.args) < 1:
             await update.message.reply_markdown_v2(
@@ -4604,7 +5764,7 @@ class TelegramCommandBot:
         ips = itertools.chain(ipv4s, ipv6s)
 
         # run ping in parallel and combine the results
-        tasks = [ping(host=ip, ipv6=True if validate_ipv6_address(ip) else False, count=4) for ip in ips]
+        tasks = [ping(host=ip, ipv6=True if validate_ipv6_address(ip) else False, count=8) for ip in ips]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         message = f"ping results for instance `{escape_markdown_v2(instance_name)}`:\n"
@@ -4660,10 +5820,10 @@ class TelegramCommandBot:
                     message += f"                 {escape_markdown_v2(v6)}\n"
                 index += 1
 
-        volumes = oci_client.list_boot_volumes(instance_id=instance.id)
+        volumes = await self.volumes(oci_profile, instance_id=instance.id)
 
         dns_records = oci_client.get_instance_records(instance=instance)
-        if isinstance(dns_records, list):
+        if isinstance(dns_records, list) and len(dns_records) > 0:
             domains = [r['name'] for r in list(cytoolz.unique(dns_records, key=lambda r: r['name']))]
             message += f"DNS Records:     "
             index = 0
@@ -4674,16 +5834,26 @@ class TelegramCommandBot:
                     message += f"                 {escape_markdown_v2(domain)}\n"
                 index += 1
 
-        if isinstance(volumes, list):
+        if isinstance(volumes, list) and len(volumes) > 0:
             message += f"Boot Volumes:    "
             index = 0
+            name_adjust = max([len(volume.display_name) for volume in volumes]) + 2
+            size_adjust = max([len(readable_size(volume.size_in_gbs, base_unit='GB')) for volume in volumes]) + 2
             for volume in volumes:
+                volume_size = readable_size(volume.size_in_gbs, base_unit='GB')
+                volume_name = volume.display_name
                 if index == 0:
-                    message += f"{escape_markdown_v2(volume.display_name)}|{escape_markdown_v2(volume.size_in_gbs)}GB\n"
+                    message += f"{volume_name.ljust(name_adjust)} {volume_size.rjust(size_adjust)}\n"
                 else:
-                    message += (f"                 {escape_markdown_v2(volume.display_name)}|"
-                                f"{escape_markdown_v2(volume.size_in_gbs)}\n")
+                    message += (f"                 {volume_name.ljust(name_adjust)} "
+                                f"{volume_size.rjust(size_adjust)}\n")
                 index += 1
+
+        allowed_ports = oci_client.get_allowed_ports(instance_id=instance.id)
+        prefix = "Allowed Ports:   "
+        allowed_ports_str = markdown_dict(allowed_ports, level=int(len(prefix) / 2) + 1)
+        if allowed_ports_str is not None:
+            message += f"Allowed Ports:   \n{allowed_ports_str}\n"
 
         message += f"```\n"
 
@@ -5078,6 +6248,10 @@ class TelegramCommandBot:
                 text=f"No records", reply_to_message_id=update.message.message_id)
         else:
             records = filter_cf_records(records, record_filters)
+            if len(records) == 0:
+                await update.message.reply_markdown_v2(
+                    text=f"No records", reply_to_message_id=update.message.message_id)
+                return
             records = sorted(records, key=lambda r: r["name"])
             # send by 100 records each time
             for i in range(0, len(records), 50):
@@ -5086,7 +6260,9 @@ class TelegramCommandBot:
                 for record in current:
                     record_name = record["name"]
                     record_ip = record["content"]
-                    message += f'`✅ {escape_markdown_v2(record_name)}`: `{escape_markdown_v2(record_ip)}`\n'
+                    created_at = record["created_on"]
+                    message += (f'`✅ {escape_markdown_v2(record_name)}`: `{escape_markdown_v2(record_ip)}`, '
+                                f'{escape_markdown_v2(created_at)}\n')
                 await update.message.reply_markdown_v2(text=message, reply_to_message_id=update.message.message_id)
 
     async def dns_records_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5248,6 +6424,161 @@ class TelegramCommandBot:
             message,
             reply_to_message_id=update.message.message_id)
 
+    async def add_security_rules_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if context.args is None or len(context.args) < 3:
+            await update.message.reply_markdown_v2(
+                text=f'''parameter error: `{escape_markdown_v2(
+                    '/add_security_rules <profile> <type> <ports>')}`''',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        oci_profile = context.args[0]
+        direction = context.args[1].upper()
+        ports = context.args[2]
+        protocols = []
+        if len(context.args) > 3:
+            protocol = context.args[3].upper()
+            if protocol not in ["TCP", "UDP"]:
+                await update.message.reply_markdown_v2(
+                    text=f'''type error: `{escape_markdown_v2(
+                        '/add_security_rules <profile> [INGRESS|EGRESS] <ports> [TCP|UDP]')}`''',
+                    reply_to_message_id=update.message.message_id)
+                return
+            protocols.append(protocol)
+        if len(protocols) == 0:
+            protocols = ["TCP", "UDP"]
+
+        accepted_directions = {
+            "INGRESS": "INGRESS",
+            "IN": "INGRESS",
+            "EGRESS": "EGRESS",
+            "OUT": "EGRESS"
+        }
+
+        if direction not in ["INGRESS", "EGRESS", "IN", "OUT"]:
+            await update.message.reply_markdown_v2(
+                text=f'''type error: `{escape_markdown_v2(
+                    '/add_security_rules <profile> [INGRESS|EGRESS] <ports>')}`''',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        direction = accepted_directions[direction]
+        if ports.upper() == "ALL":
+            protocols = ["ALL"]
+        # ports should be like 80,443,8080-8090
+        else:
+            ports = ports.split(',')
+            ports = [port.strip() for port in ports if port is not None and len(port.strip()) > 0]
+            invalid_ports = []
+            for port in ports:
+                # remove the invalid port
+                if not re.match(r"(\d+)-(\d+)", port) and not re.match(r"\d+", port):
+                    invalid_ports.append(port)
+                    ports.remove(port)
+            if len(invalid_ports) > 0:
+                await update.message.reply_markdown_v2(
+                    text=f'''invalid ports: `{markdown_list(invalid_ports)}`''',
+                    reply_to_message_id=update.message.message_id)
+
+            if len(ports) == 0:
+                await update.message.reply_markdown_v2(
+                    text=f'''invalid ports, should be like: `{escape_markdown_v2('80,443,8080-8090')}`''',
+                    reply_to_message_id=update.message.message_id)
+                return
+
+        oci_client = self.oci_client(oci_profile)
+        if oci_client is None:
+            await update.message.reply_markdown_v2(
+                text=f"profile not found: `{escape_markdown_v2(oci_profile)}`",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        vcns = oci_client.list_vcns()
+        if isinstance(vcns, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to list vcns, errors: `{escape_markdown_v2(str(vcns))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        if len(vcns) == 0:
+            await update.message.reply_markdown_v2(
+                text=f'no vcns found for profile `{escape_markdown_v2(oci_profile)}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        tasks = []
+        for vcn in vcns:
+            for protocol in protocols:
+                for is_ipv6 in [True, False]:
+                    if protocol == "ALL":
+                        ports = [None]
+                    for port in ports:
+                        tasks.append(self.allow_port_on_vcn(oci_client,
+                                                            vcn=vcn,
+                                                            port=port,
+                                                            is_ipv6=is_ipv6,
+                                                            direction=direction,
+                                                            protocol=protocol))
+
+        results = await asyncio.gather(*tasks)
+        message = f"add security rules for `{escape_markdown_v2(oci_profile)}`:\n"
+        for proto, is_ipv6, port, direction, result in results:
+            port_str = f'`{escape_markdown_v2(port)}`' if port is not None else ""
+            ip_str = 'IPv6' if is_ipv6 else 'IPv4'
+            if is_failed(result):
+                message += f'fail to add security rules for `{proto}` `{ip_str}` ports {port_str}: `{direction}`, ' \
+                           f'errors: `{escape_markdown_v2(str(result))}`\n'
+            else:
+                message += f'add security rules for `{proto}` `{ip_str}` ports {port_str}: `{direction}` success\n'
+
+        await update.message.reply_markdown_v2(text=message, reply_to_message_id=update.message.message_id)
+
+    @staticmethod
+    async def allow_port_on_vcn(oci_client: OCIClient, vcn: Vcn,
+                                direction: str, port: str = None, is_ipv6: bool = False, protocol="TCP"):
+        min_port, max_port = None, None
+        if protocol not in ['ALL']:
+            if '-' in port:
+                min_port, max_port = port.split('-')
+                min_port, max_port = int(min_port), int(max_port)
+            else:
+                min_port, max_port = int(port), int(port)
+        return protocol, is_ipv6, port, direction, oci_client.allow_vcn_ports(vcn,
+                                                                              min_port=min_port,
+                                                                              max_port=max_port,
+                                                                              is_ipv6=is_ipv6,
+                                                                              direction=direction,
+                                                                              protocol=protocol)
+
+    async def clear_security_rules_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if context.args is None or len(context.args) < 1:
+            await update.message.reply_markdown_v2(
+                text=f'''parameter error: `{escape_markdown_v2(
+                    '/clear_security_rules <profile>')}`''',
+                reply_to_message_id=update.message.message_id)
+            return
+        oci_profile = context.args[0]
+        oci_client = self.oci_client(oci_profile)
+        if isinstance(oci_client, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to get oci client for profile `{escape_markdown_v2(oci_profile)}`, '
+                     f'errors: `{escape_markdown_v2(str(oci_client))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        vcns = oci_client.list_vcns()
+        if isinstance(vcns, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to list vcns, errors: `{escape_markdown_v2(str(vcns))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        tasks = [oci_client.clear_vcn_security_lists(vcn=vcn) for vcn in vcns]
+        await asyncio.gather(*tasks)
+        await update.message.reply_markdown_v2(
+            f"clear security rules for `{escape_markdown_v2(oci_profile)}` success",
+            reply_to_message_id=update.message.message_id)
+
     @staticmethod
     async def help_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
@@ -5302,8 +6633,34 @@ def main():
     logger.add(log_file, rotation="1day", retention="7 days", level="DEBUG", compression="gz")
 
     cmd_args = parse_arguments()
-
     ssh_authorize_keys = cmd_args.ssh_authorized_keys
+    cloudflare_email = cmd_args.cloudflare_email
+    cloudflare_api_key = cmd_args.cloudflare_api_key
+    cloudflare_zone_id = cmd_args.cloudflare_zone_id
+    telegram_bot_token = cmd_args.telegram_bot_token
+    telegram_users = cmd_args.telegram_users
+
+    ssh_authorize_keys = ssh_authorize_keys.strip() if ssh_authorize_keys is not None \
+        else os.environ.get("SSH_AUTHORIZED_KEYS", None)
+    cloudflare_email = cloudflare_email.strip() if cloudflare_email is not None \
+        else os.environ.get("CLOUDFLARE_EMAIL", None)
+
+    cloudflare_api_key = cloudflare_api_key.strip() if cloudflare_api_key is not None \
+        else os.environ.get("CLOUDFLARE_API_KEY", None)
+
+    cloudflare_zone_id = cloudflare_zone_id.strip() if cloudflare_zone_id is not None \
+        else os.environ.get("CLOUDFLARE_ZONE_ID", None)
+
+    telegram_bot_token = telegram_bot_token.strip() if telegram_bot_token is not None \
+        else os.environ.get("TELEGRAM_BOT_TOKEN", None)
+
+    telegram_users = telegram_users if telegram_users is not None and len(telegram_users) > 0 \
+        else os.environ.get("TELEGRAM_USERS", None)
+
+    if telegram_users is not None and isinstance(telegram_users, str):
+        telegram_users = telegram_users.split(" ")
+        telegram_users = [user.strip() for user in telegram_users if user is not None and len(user.strip()) > 0]
+
     if ssh_authorize_keys is not None and os.path.exists(ssh_authorize_keys):
         with open(ssh_authorize_keys) as f:
             ssh_authorize_keys = f.read().strip()
@@ -5314,16 +6671,16 @@ def main():
 
     # cloudflare should have all the parameters
     cf = None
-    if (cmd_args.cloudflare_email is not None
-            and cmd_args.cloudflare_api_key is not None
-            and cmd_args.cloudflare_zone_id is not None):
-        cf = CloudFlareClient(email=cmd_args.cloudflare_email, api_key=cmd_args.cloudflare_api_key,
-                              zone_id=cmd_args.cloudflare_zone_id)
+    if (cloudflare_email is not None
+            and cloudflare_api_key is not None
+            and cloudflare_zone_id is not None):
+        cf = CloudFlareClient(email=cloudflare_email, api_key=cloudflare_api_key,
+                              zone_id=cloudflare_zone_id)
 
     elif (
-            cmd_args.cloudflare_email is not None or
-            cmd_args.cloudflare_api_key is not None or
-            cmd_args.cloudflare_zone_id is not None):
+            cloudflare_email is not None or
+            cloudflare_api_key is not None or
+            cloudflare_zone_id is not None):
         logger.warning(
             f"cloudflare config is not valid, should have all the parameters: `email`, `api_key`, `zone_id`")
         cf = None
@@ -5333,8 +6690,6 @@ def main():
     if not os.path.exists(config_file):
         logger.warning(f"config file not found: {config_file}, create one")
 
-    telegram_bot_token = cmd_args.telegram_bot_token
-    telegram_users = cmd_args.telegram_users
     bot = None
     if telegram_bot_token is not None:
         bot = TelegramBot(token=telegram_bot_token)
@@ -5369,6 +6724,7 @@ def main():
                              whitelist=telegram_users,
                              cloudflare=cf,
                              oci_config_file=os.path.abspath(config_file),
+                             message_bot=bot
                              )
     bot.start()
 

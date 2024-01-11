@@ -1,8 +1,13 @@
 .oci
+.git
+.idea
 venv
 .gitignore
+.dockerignore
 *.pem
 README.md
 LICENSE
 *.json
 run
+docker-compose.yml
+Dockerfile

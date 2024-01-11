@@ -12,7 +12,7 @@ RUN apk add --no-cache --update \
 
 COPY requirements.txt .
 
-RUN pip install -r requirements.txt
+RUN pip install -r requirements.txt -U
 
 COPY . .
 
@@ -22,4 +22,4 @@ FROM base as prod
 ADD docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 ENTRYPOINT ["/docker-entrypoint.sh"]
-CMD ["python", "oracle.py"]
+CMD ["python", "oci_bot.py"]

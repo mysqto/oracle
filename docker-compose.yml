@@ -1,0 +1,11 @@
+services:
+  oci_bot:
+    build:
+        context: .
+        dockerfile: Dockerfile
+    image: oci_bot
+    restart: on-failure
+    volumes:
+      - .oci:/app/.oci
+    env_file:
+      - .oci/env
