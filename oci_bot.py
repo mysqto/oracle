@@ -627,6 +627,10 @@ oci_regions = {
         "country_code": "SG",
         "city": "Singapore",
     },
+    "ap-singapore-2": {
+        "country_code": "SG",
+        "city": "Singapore",
+    },
     "us-sanjose-1": {
         "country_code": "US",
         "city": "San Jose",
