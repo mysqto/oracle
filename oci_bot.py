@@ -4795,8 +4795,9 @@ class TelegramCommandBot:
 
     async def list_profiles_handler(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         oci_profiles = self.oci_clients.keys()
-        message = f"*profile list*:\n"
+
         profiles = []
+        message = ""
         flagged_city_adjust = max([len(self.city(oci_profile)) for oci_profile in oci_profiles]) + 2
         tenancy_adjust = max([len(oci_profile) for oci_profile in oci_profiles]) + 2
         for oci_profile in oci_profiles:
@@ -4806,9 +4807,13 @@ class TelegramCommandBot:
             spaces = " " * (flagged_city_adjust - len(city_text))
             profiles.append(f'''{country_flag}`{city_text}``{spaces}`: `{tenancy_text.rjust(tenancy_adjust)}`''')
         sorted_profiles = sorted(profiles)
-        message += "\n".join(sorted_profiles)
-        await update.message.reply_markdown_v2(text=message,
-                                               reply_to_message_id=update.message.message_id)
+
+        for i in range(0, len(oci_profiles), 24):
+            if i == 0:
+                message += f"*profile list*:\n"
+            message = "\n".join(sorted_profiles[i:i + 24 if i + 24 < len(oci_profiles) else len(oci_profiles)]) + "\n"
+            await update.message.reply_markdown_v2(text=message,
+                                                   reply_to_message_id=update.message.message_id)
 
     async def delete_profiles_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if len(context.args) == 0:
