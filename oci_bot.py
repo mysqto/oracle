@@ -4020,73 +4020,6 @@ class Task:
             self.end_time = datetime.now()
 
 
-class InstanceCacheEntry:
-    __last_update__: datetime = None
-    __instances__: dict[str, Instance] = None
-
-    def __init__(self, instances: list[Instance] = None):
-        self.__last_update__ = datetime.now()
-        self.__instances__ = {}
-        self.add(instances)
-
-    @property
-    def last_update(self):
-        return self.__last_update__
-
-    @last_update.setter
-    def last_update(self, value):
-        self.__last_update__ = value
-
-    @property
-    def instances(self):
-        return self.__instances__
-
-    @instances.setter
-    def instances(self, value):
-        self.__instances__ = value
-
-    def add(self, val: Instance | list[Instance]):
-        if self.instances is None:
-            self.instances = {}
-
-        if isinstance(val, list):
-            for v in val:
-                self.add(v)
-            return
-        # keep track of both id and display_name
-        self.instances[val.id] = val
-        self.instances[val.display_name] = val
-        self.last_update = datetime.now()
-
-    def all_instances(self) -> list[Instance]:
-        if self.instances is None:
-            return []
-
-        # only return by id
-        instances = []
-        for key, value in self.instances.items():
-            if key.startswith('ocid1.instance.'):
-                instances.append(value)
-        return instances
-
-    def remove(self, instance: Instance | list[Instance]):
-        if self.instances is None:
-            return
-        if isinstance(instance, list):
-            for i in instance:
-                self.remove(i)
-            return
-        self.instances.pop(instance.id, None)
-        self.instances.pop(instance.display_name, None)
-        self.last_update = datetime.now()
-
-    def get_instance(self, key: str) -> Instance | None:
-        return self.instances.get(key)
-
-    def expire(self):
-        self.__last_update__ = datetime.min
-
-
 class TelegramCommandBot:
     __thread_pool__ = None
     __oci_clients__ = None
@@ -4102,7 +4035,6 @@ class TelegramCommandBot:
     __key_dir__: str = os.path.join(__base_dir__, "keys")
     __tasks__: dict[str, Task] = {}
     __exiting__: threading.Event = threading.Event()
-    __instance_cache__: dict[str, InstanceCacheEntry] = {}
 
     @property
     def thread_pool(self):
@@ -4207,10 +4139,6 @@ class TelegramCommandBot:
     @config_file.setter
     def config_file(self, value):
         self.__config_file__ = value
-
-    @property
-    def instance_cache(self):
-        return self.__instance_cache__
 
     @property
     def exiting(self):
@@ -4511,24 +4439,15 @@ class TelegramCommandBot:
     def profile_tasks(self, profile_name):
         return [task for task in self.tasks.values() if task.oci_profile == profile_name and task.status == "RUNNING"]
 
-    def profile_instances(self, profile_name, use_cache=True):
-        if profile_name in self.instance_cache and use_cache:
-            cached = self.instance_cache.get(profile_name)
-            if (datetime.now() - cached.last_update).seconds <= 300:
-                return cached.all_instances()
+    def profile_instances(self, profile_name):
         oci_client = self.oci_client(profile_name)
         if oci_client is None:
             return profile_name, Status(http.client.BAD_REQUEST,
                                         "NoOCIProfile", f"OCI Profile not found: {profile_name}")
-        instances = oci_client.list_instances()
-        if isinstance(instances, Status):
-            return instances
-        # update cache
-        self.instance_cache[profile_name] = InstanceCacheEntry(instances)
-        return instances
+        return oci_client.list_instances()
 
-    async def list_instances(self, profile_name, use_cache=True):
-        return profile_name, self.profile_instances(profile_name, use_cache)
+    async def list_instances(self, profile_name):
+        return profile_name, self.profile_instances(profile_name)
 
     async def list_volumes(self, profile_name, instance_id=None):
         oci_client = self.oci_clients.get(profile_name)
