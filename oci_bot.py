@@ -5248,7 +5248,7 @@ class TelegramCommandBot:
 
         profile_name = context.args[0]
         instance_name = context.args[1]
-        size_in_gbs = context.args[2].Upper()
+        size_in_gbs = context.args[2].upper()
         size_in_gbs = size_in_gbs.replace("GB", "").replace("G", "")  # remove GB or G
 
         if not size_in_gbs.isdigit():
