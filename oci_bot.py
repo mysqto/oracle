@@ -563,6 +563,10 @@ oci_regions = {
         "country_code": "SA",
         "city": "Jeddah",
     },
+    "me-riyadh-1": {
+        "country_code": "SA",
+        "city": "Riyadh",
+    },
     "af-johannesburg-1": {
         "country_code": "ZA",
         "city": "Johannesburg",

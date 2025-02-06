@@ -1,9 +1,9 @@
-oci~=2.128.2
+oci~=2.144.0
 requests~=2.32.3
-loguru~=0.7.2
-cytoolz~=0.12.3
-python-telegram-bot~=21.3
-python-telegram-bot[job-queue]~=21.3
+loguru~=0.7.3
+cytoolz~=1.0.1
+python-telegram-bot~=21.10
+python-telegram-bot[job-queue]~=21.10
 cloudflare~=2.20.0
-psutil~=6.0.0
+psutil~=6.1.1
 py-cpuinfo~=9.0.0
