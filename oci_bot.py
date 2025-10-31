@@ -1547,6 +1547,9 @@ class OCIClient:
     __ready__ = False  # Track if connection is warmed up and ready
     __method_cache__ = {}  # Cache for frequently called methods
     __cache_ttl__ = 15  # Default TTL for method caching (seconds)
+    __auth_failure_count__ = 0  # Track authentication failures
+    __max_auth_failures__ = 5  # Max failures before marking as dead
+    __is_dead__ = False  # Mark profile as dead after repeated auth failures
 
     def notify(self, message: str, update: Update = None):
         self.warning(message)
@@ -1768,6 +1771,60 @@ class OCIClient:
     def ready(self, value):
         """Set the ready status of this OCI client"""
         self.__ready__ = value
+    
+    @property
+    def is_dead(self):
+        """Check if this profile is marked as dead (too many auth failures)"""
+        return self.__is_dead__
+    
+    @property
+    def auth_failure_count(self):
+        """Get the authentication failure count"""
+        return self.__auth_failure_count__
+    
+    def record_auth_failure(self):
+        """Record an authentication failure and mark as dead if threshold exceeded"""
+        self.__auth_failure_count__ += 1
+        if self.__auth_failure_count__ >= self.__max_auth_failures__:
+            self.__is_dead__ = True
+            self.warning(f"Profile marked as DEAD after {self.__auth_failure_count__} authentication failures")
+            return True  # Newly marked as dead
+        else:
+            self.warning(f"Authentication failure #{self.__auth_failure_count__}/{self.__max_auth_failures__}")
+            return False
+    
+    def reset_auth_failures(self):
+        """Reset failure count (e.g., after successful authentication)"""
+        if self.__auth_failure_count__ > 0:
+            self.info(f"Resetting auth failure count (was {self.__auth_failure_count__})")
+            self.__auth_failure_count__ = 0
+            self.__is_dead__ = False
+    
+    def mark_as_dead(self, dead=True):
+        """Manually mark or unmark this profile as dead/not dead"""
+        if dead:
+            self.__auth_failure_count__ = self.__max_auth_failures__
+            self.__is_dead__ = True
+            self.warning(f"Profile manually marked as DEAD")
+        else:
+            self.reset_auth_failures()
+            self.info(f"Profile manually marked as ALIVE")
+    
+    def handle_api_result(self, result):
+        """Handle API result - check for auth failures and mark dead if needed"""
+        if isinstance(result, Status):
+            # Check for authentication failures
+            if ((result.status == http.client.NOT_FOUND and result.code == 'NotAuthorizedOrNotFound') or
+                    (result.status == http.client.UNAUTHORIZED and result.code == 'NotAuthenticated')):
+                self.record_auth_failure()
+            else:
+                # Other error - reset counter on any non-auth error
+                # This prevents marking as dead for transient issues
+                pass
+        else:
+            # Successful call - reset failure counter
+            self.reset_auth_failures()
+        return result
     
     def _get_cached_method_result(self, method_name, key, ttl=None):
         """Get cached result of a method call"""
@@ -3250,10 +3307,21 @@ class OCIClient:
         return availability_domains[0]
 
     def get_tenancy(self) -> Tenancy | Status:
+        # Skip dead profiles to avoid wasting time
+        if self.is_dead:
+            return Status(http.client.UNAUTHORIZED, "ProfileDead", 
+                         f"Profile marked as dead after {self.auth_failure_count} auth failures")
+        
         try:
-            return self.identity_client.get_tenancy(self.compartment_id).data
+            tenancy = self.identity_client.get_tenancy(self.compartment_id).data
+            # Successful call - reset failure counter
+            self.reset_auth_failures()
+            return tenancy
         except ServiceError as e:
-            return Status(e.status, e.code, e.message)
+            result = Status(e.status, e.code, e.message)
+            # Check and handle authentication failures
+            self.handle_api_result(result)
+            return result
 
     def list_subnets(self, vcn_id=None) -> list[Subnet] | Status:
         try:
@@ -3573,16 +3641,25 @@ class OCIClient:
             return Status(e.status, e.code, e.message)
 
     def list_instances(self, status=None) -> list[Instance] | Status:
+        # Skip dead profiles to avoid wasting time
+        if self.is_dead:
+            return Status(http.client.UNAUTHORIZED, "ProfileDead", 
+                         f"Profile marked as dead after {self.auth_failure_count} auth failures")
+        
         match_instances = []
-
         try:
             instances = self.oci_client.list_instances(self.compartment_id).data
             for instance in instances:
                 if status is None or instance.lifecycle_state == status:
                     match_instances.append(instance)
+            # Successful call - reset failure counter
+            self.reset_auth_failures()
+            return match_instances
         except ServiceError as e:
-            return Status(e.status, e.code, e.message)
-        return match_instances
+            result = Status(e.status, e.code, e.message)
+            # Check and handle authentication failures
+            self.handle_api_result(result)
+            return result
 
     async def list_stopped_instances(self) -> list[Instance] | Status:
         return self.list_instances(status="STOPPED")
@@ -4417,6 +4494,32 @@ class TelegramCommandBot:
         self._clear_cache(f"boot_volumes_{profile_name}")
         self._clear_cache(f"live_check_{profile_name}")
         logger.debug(f"Cleared cache for profile: {profile_name}")
+    
+    def load_dead_profiles(self):
+        """Load dead profiles from config file"""
+        if not os.path.exists(self.oci_config_file):
+            return
+        
+        try:
+            config_parser = ConfigParser()
+            with open(self.oci_config_file) as configfile:
+                config_parser.read_file(configfile)
+            
+            dead_count = 0
+            for section in config_parser.sections():
+                dead_flag = config_parser.get(section, "dead", fallback="false").lower()
+                if dead_flag == "true":
+                    oci_client = self.oci_clients.get(section)
+                    if oci_client:
+                        # Mark as dead using the method
+                        oci_client.mark_as_dead(dead=True)
+                        dead_count += 1
+                        logger.debug(f"Restored dead status for profile: {section}")
+            
+            if dead_count > 0:
+                logger.info(f"Loaded {dead_count} dead profiles from config file")
+        except Exception as e:
+            logger.warning(f"Failed to load dead profiles from config: {e}")
 
     def register_and_start_tasks(self, task: Task) -> Status:
         self.__tasks__[task.id] = task
@@ -4494,6 +4597,11 @@ class TelegramCommandBot:
                 config_parser.set(oci_profile, "region", c.region)
                 if c.pass_phrase is not None:
                     config_parser.set(oci_profile, "pass_phrase", c.pass_phrase)
+                # Save dead flag (default to false)
+                if oci_client.is_dead:
+                    config_parser.set(oci_profile, "dead", "true")
+                else:
+                    config_parser.set(oci_profile, "dead", "false")
 
             new_config_file = f"{self.oci_config_file}.new"
             with open(new_config_file, 'w') as configfile:  # save
@@ -4629,23 +4737,36 @@ class TelegramCommandBot:
             # Check if we're shutting down
             if self.exiting.is_set():
                 logger.debug(f"Skipping warmup for {profile_name} - shutting down")
-                return profile_name, False
+                return profile_name, False, "shutdown"
             
             try:
                 oci_client = self.oci_clients.get(profile_name)
                 if oci_client:
                     # Make a lightweight call - list_availability_domains is quick
                     oci_client.list_availability_domains()
+                    
+                    # Check if marked as dead during the call
+                    if oci_client.is_dead:
+                        logger.warning(f"💀 Profile {profile_name} marked as DEAD (auth failures: {oci_client.auth_failure_count})")
+                        return profile_name, False, "dead"
+                    
                     # Mark as ready first
                     oci_client.ready = True
                     # Now that we're ready, update the name (will call get_tenancy)
-                    oci_client.name(skip_api_call=False)
+                    result = oci_client.name(skip_api_call=False)
+                    
+                    # Check again after get_tenancy call
+                    if oci_client.is_dead:
+                        logger.warning(f"💀 Profile {profile_name} marked as DEAD during name resolution")
+                        oci_client.ready = False  # Not ready if dead
+                        return profile_name, False, "dead"
+                    
                     logger.debug(f"✓ Warmed up connection for {profile_name} (name: {oci_client.client_name})")
-                    return profile_name, True
+                    return profile_name, True, "success"
             except Exception as e:
                 logger.warning(f"✗ Failed to warm up {profile_name}: {e}")
                 # Keep ready = False (default)
-                return profile_name, False
+                return profile_name, False, "error"
         
         # Warm up all profiles concurrently using thread pool
         try:
@@ -4665,11 +4786,17 @@ class TelegramCommandBot:
                 except Exception as e:
                     profile = futures[future]
                     logger.warning(f"✗ Exception warming up {profile}: {e}")
-                    results.append((profile, False))
+                    results.append((profile, False, "exception"))
             
-            # Count successes
-            success_count = sum(1 for _, success in results if success)
-            logger.info(f"Connection warmup complete: {success_count}/{len(self.oci_clients)} profiles ready")
+            # Count successes and dead profiles
+            success_count = sum(1 for _, success, _ in results if success)
+            dead_count = sum(1 for _, _, reason in results if reason == "dead")
+            error_count = sum(1 for _, success, reason in results if not success and reason not in ["dead", "shutdown"])
+            
+            logger.info(f"Connection warmup complete: "
+                       f"{success_count}/{len(self.oci_clients)} ready, "
+                       f"{dead_count} dead (auth failures), "
+                       f"{error_count} errors")
         except RuntimeError as e:
             # Handle case where interpreter is shutting down
             logger.warning(f"Warmup interrupted due to shutdown: {e}")
@@ -4716,6 +4843,9 @@ class TelegramCommandBot:
             logger.error(f"Failed to build telegram bot application: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             raise
+
+        self.load_dead_profiles()
+        
         self.load_tasks()
         add_profile_handler = ConversationHandler(
             entry_points=[CommandHandler("add_profile", self.start_add_profile_handler)],
@@ -4739,6 +4869,7 @@ class TelegramCommandBot:
         self.telegram_bot.add_handler(CommandHandler("instances", self.list_instances_handler))
         self.telegram_bot.add_handler(CommandHandler("profiles", self.list_profiles_handler))
         self.telegram_bot.add_handler(CommandHandler("delete_profiles", self.delete_profiles_handler))
+        self.telegram_bot.add_handler(CommandHandler("mark_dead", self.mark_dead_handler))
         self.telegram_bot.add_handler(CommandHandler("volumes", self.list_volumes_handler))
         self.telegram_bot.add_handler(CommandHandler("attach_volume", self.volume_action_handler))
         self.telegram_bot.add_handler(CommandHandler("detach_volume", self.volume_action_handler))
@@ -4824,12 +4955,23 @@ class TelegramCommandBot:
     def profile_instances(self, profile_name):
         oci_client = self.oci_client(profile_name)
         if oci_client is None:
-            return profile_name, Status(http.client.BAD_REQUEST,
-                                        "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+            return Status(http.client.BAD_REQUEST,
+                         "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        # Skip dead profiles - no point making API calls
+        if oci_client.is_dead:
+            return Status(http.client.UNAUTHORIZED, "ProfileDead",
+                         f"Profile marked as dead after {oci_client.auth_failure_count} auth failures")
         return oci_client.list_instances()
 
     async def list_instances(self, profile_name):
         """Run the synchronous OCI call in a thread for true async execution with caching and rate limiting"""
+        # Check if profile is dead - return cached dead status
+        oci_client = self.oci_client(profile_name)
+        if oci_client and oci_client.is_dead:
+            dead_status = Status(http.client.UNAUTHORIZED, "ProfileDead",
+                                f"Profile marked as dead after {oci_client.auth_failure_count} auth failures")
+            return profile_name, dead_status
+        
         cache_key = f"instances_{profile_name}"
         cached = self._get_cached(cache_key, ttl=30)  # 30s cache
         if cached is not None:
@@ -4850,15 +4992,19 @@ class TelegramCommandBot:
 
     async def list_volumes(self, profile_name, instance_id=None):
         """Run the synchronous OCI call in a thread for true async execution with caching and rate limiting"""
-        cache_key = f"volumes_{profile_name}_{instance_id}"
-        cached = self._get_cached(cache_key, ttl=45)  # 45s cache
-        if cached is not None:
-            return profile_name, cached
-        
+        # Check if profile is dead
         oci_client = self.oci_clients.get(profile_name)
         if oci_client is None:
             return profile_name, Status(http.client.BAD_REQUEST,
                                         "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        if oci_client.is_dead:
+            return profile_name, Status(http.client.UNAUTHORIZED, "ProfileDead",
+                                       f"Profile marked as dead after {oci_client.auth_failure_count} auth failures")
+        
+        cache_key = f"volumes_{profile_name}_{instance_id}"
+        cached = self._get_cached(cache_key, ttl=45)  # 45s cache
+        if cached is not None:
+            return profile_name, cached
         
         # Wait for profile to be ready if warmup is still in progress
         if not self.is_profile_ready(profile_name):
@@ -4875,15 +5021,19 @@ class TelegramCommandBot:
 
     async def list_boot_volumes(self, profile_name, instance_id=None):
         """Run the synchronous OCI call in a thread for true async execution with caching and rate limiting"""
-        cache_key = f"boot_volumes_{profile_name}_{instance_id}"
-        cached = self._get_cached(cache_key, ttl=45)  # 45s cache
-        if cached is not None:
-            return profile_name, cached
-        
+        # Check if profile is dead
         oci_client = self.oci_clients.get(profile_name)
         if oci_client is None:
             return profile_name, Status(http.client.BAD_REQUEST,
                                         "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        if oci_client.is_dead:
+            return profile_name, Status(http.client.UNAUTHORIZED, "ProfileDead",
+                                       f"Profile marked as dead after {oci_client.auth_failure_count} auth failures")
+        
+        cache_key = f"boot_volumes_{profile_name}_{instance_id}"
+        cached = self._get_cached(cache_key, ttl=45)  # 45s cache
+        if cached is not None:
+            return profile_name, cached
 
         # Wait for profile to be ready if warmup is still in progress
         if not self.is_profile_ready(profile_name):
@@ -4941,15 +5091,19 @@ class TelegramCommandBot:
 
     async def tenancy(self, profile_name):
         """Run the synchronous OCI call in a thread for true async execution with caching and rate limiting"""
-        cache_key = f"tenancy_{profile_name}"
-        cached = self._get_cached(cache_key, ttl=300)  # 5 min cache (tenancy rarely changes)
-        if cached is not None:
-            return profile_name, cached
-        
+        # Check if profile is dead
         oci_client = self.oci_clients.get(profile_name)
         if oci_client is None:
             return profile_name, Status(http.client.BAD_REQUEST,
                                         "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        if oci_client.is_dead:
+            return profile_name, Status(http.client.UNAUTHORIZED, "ProfileDead",
+                                       f"Profile marked as dead after {oci_client.auth_failure_count} auth failures")
+        
+        cache_key = f"tenancy_{profile_name}"
+        cached = self._get_cached(cache_key, ttl=300)  # 5 min cache (tenancy rarely changes)
+        if cached is not None:
+            return profile_name, cached
         
         # Wait for profile to be ready if warmup is still in progress
         if not self.is_profile_ready(profile_name):
@@ -4977,6 +5131,13 @@ class TelegramCommandBot:
             self._set_cache(cache_key, result)
             return result
         
+        # Check if already marked as dead
+        if oci_client.is_dead:
+            display_name = f'{self.flagged_city(profile_name)} - {profile_name}'
+            result = (display_name, f'💀Dead ({oci_client.auth_failure_count} auth failures)')
+            self._set_cache(cache_key, result)
+            return result
+        
         # Wait for profile to be ready if warmup is still in progress
         if not self.is_profile_ready(profile_name):
             logger.debug(f"Profile {profile_name} not ready yet, waiting...")
@@ -4992,7 +5153,10 @@ class TelegramCommandBot:
             
             if isinstance(check_result, Status):
                 logger.warning(f"fail to get instances for profile {display_name}, details: {check_result}")
-                if ((check_result.status == http.client.NOT_FOUND and check_result.code == 'NotAuthorizedOrNotFound') or
+                # Check if profile was marked dead
+                if check_result.code == 'ProfileDead':
+                    result = (display_name, f'💀Dead ({oci_client.auth_failure_count} auth failures)')
+                elif ((check_result.status == http.client.NOT_FOUND and check_result.code == 'NotAuthorizedOrNotFound') or
                         (check_result.status == http.client.UNAUTHORIZED and check_result.code == 'NotAuthenticated')):
                     result = (display_name, '💀Dead')
                 else:
@@ -5245,6 +5409,72 @@ class TelegramCommandBot:
                 message += f', {len(tasks)} tasks aborted'
             await update.message.reply_markdown_v2(text=message,
                                                    reply_to_message_id=update.message.message_id)
+
+    async def mark_dead_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Mark or unmark a profile as dead/not dead
+        
+        Usage: /mark_dead <profile_name> <dead|alive|true|false>
+        """
+        if len(context.args) < 2:
+            await update.message.reply_markdown_v2(
+                text=f'Usage: `/mark\\_dead` `<profile\\_name>` `<dead|alive|true|false>`\n'
+                     f'Example: `/mark\\_dead` `my\\_profile` `dead`',
+                reply_to_message_id=update.message.message_id)
+            return
+        
+        profile_name = context.args[0]
+        status_arg = context.args[1].lower()
+        
+        # Parse status argument
+        if status_arg in ['dead', 'true', '1', 'yes']:
+            mark_as_dead = True
+        elif status_arg in ['alive', 'false', '0', 'no']:
+            mark_as_dead = False
+        else:
+            await update.message.reply_markdown_v2(
+                text=f'Invalid status: `{escape_markdown_v2(status_arg)}`\n'
+                     f'Use: `dead`, `alive`, `true`, or `false`',
+                reply_to_message_id=update.message.message_id)
+            return
+        
+        # Check if profile exists
+        if profile_name not in self.oci_clients.keys():
+            await update.message.reply_markdown_v2(
+                text=f'profile `{escape_markdown_v2(profile_name)}` not found',
+                reply_to_message_id=update.message.message_id)
+            return
+        
+        oci_client = self.oci_clients.get(profile_name)
+        if oci_client is None:
+            await update.message.reply_markdown_v2(
+                text=f'profile `{escape_markdown_v2(profile_name)}` client not found',
+                reply_to_message_id=update.message.message_id)
+            return
+        
+        # Update dead status using the method
+        oci_client.mark_as_dead(dead=mark_as_dead)
+        
+        if mark_as_dead:
+            status_text = "☠️ DEAD"
+            action_text = "marked as dead"
+        else:
+            status_text = "✅ ALIVE"
+            action_text = "marked as alive"
+        
+        # Save config immediately
+        save_result = self.save_oci_config()
+        if is_failed(save_result):
+            await update.message.reply_markdown_v2(
+                text=f'profile `{escape_markdown_v2(profile_name)}` {action_text}, '
+                     f'but failed to save config: `{escape_markdown_v2(str(save_result))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+        
+        # Send confirmation
+        await update.message.reply_markdown_v2(
+            text=f'profile `{escape_markdown_v2(profile_name)}` {action_text} {status_text}\n'
+                 f'Config saved successfully',
+            reply_to_message_id=update.message.message_id)
 
     @staticmethod
     async def start_add_profile_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> int:
@@ -7009,6 +7239,7 @@ class TelegramCommandBot:
         await update.message.reply_markdown_v2(
             text=prefix + f"```bash\n"
                           f"/profiles \\- list profiles\n"
+                          f"/mark\\_dead       \\<profile\\> \\<dead|alive|true|false\\> \\- mark profile as dead/alive\n"
                           f"/instances       \\<profile\\> \\- list instances\n"
                           f"/dns\\_records     \\<profile\\> \\<instance_name\\> \\- list dns records\n"
                           f"/change_ip       \\<profile\\> \\<instance_name\\> \\[EPHEMERAL\\|RESERVED\\] \\- "
