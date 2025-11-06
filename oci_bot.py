@@ -5183,14 +5183,42 @@ class TelegramCommandBot:
             profiles = self.oci_clients.keys()
         result = await self.alive_check(profiles=profiles)
         result = sorted(result, key=lambda x: x[0])
-        message = f"*OCI Profile Status*:\n"
+        
+        if len(result) == 0:
+            await update.message.reply_markdown_v2(
+                text="No profiles found",
+                reply_to_message_id=update.message.message_id)
+            return
+        
+        # Calculate padding for alignment
         adjusted = max([len(profile_name) for profile_name, _ in result]) + 2
-        message += "```bash\n"
-        for profile_name, status in result:
-            message += f"{profile_name.ljust(adjusted)}: {status}\n"
-        message += "```"
-        await update.message.reply_markdown_v2(text=message,
-                                               reply_to_message_id=update.message.message_id)
+        
+        # Paginate results (30 profiles per message to stay under Telegram's 4096 char limit)
+        chunk_size = 30
+        total_pages = (len(result) + chunk_size - 1) // chunk_size
+        
+        for page in range(total_pages):
+            start_idx = page * chunk_size
+            end_idx = min(start_idx + chunk_size, len(result))
+            chunk = result[start_idx:end_idx]
+            
+            # Build message for this chunk
+            message = f"*OCI Profile Status*"
+            if total_pages > 1:
+                message += f" \\(Page {page + 1}/{total_pages}\\)"
+            message += ":\n"
+            message += "```bash\n"
+            for profile_name, status in chunk:
+                message += f"{profile_name.ljust(adjusted)}: {status}\n"
+            message += "```"
+            
+            # Send message (first message replies to original, others are new messages)
+            if page == 0:
+                await update.message.reply_markdown_v2(
+                    text=message,
+                    reply_to_message_id=update.message.message_id)
+            else:
+                await update.message.reply_markdown_v2(text=message)
 
     async def permission_handler(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message.chat.type == ChatType.GROUP:
