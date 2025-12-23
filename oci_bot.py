@@ -4891,6 +4891,8 @@ class TelegramCommandBot:
                                                      self.create_console_connection_handler))
         self.telegram_bot.add_handler(CommandHandler("console_connections",
                                                      self.get_console_connection_handler))
+        self.telegram_bot.add_handler(CommandHandler("console_connection",
+                                                     self.get_or_create_console_connection_handler))
         self.telegram_bot.add_handler(CommandHandler("resize_boot_volume", self.resize_boot_volume_handler))
         self.telegram_bot.add_handler(CommandHandler("delete_instance", self.delete_instance_handler))
         self.telegram_bot.add_handler(CommandHandler("start_instance", self.start_instance_handler))
@@ -5221,6 +5223,8 @@ class TelegramCommandBot:
                 await update.message.reply_markdown_v2(text=message)
 
     async def permission_handler(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.message is None:
+            return
         if update.message.chat.type == ChatType.GROUP:
             await update.message.reply_markdown_v2(text="please add me to your private chat",
                                                    reply_to_message_id=update.message.message_id)
@@ -6386,6 +6390,109 @@ class TelegramCommandBot:
                                                      f", passphrase is `{escape_markdown_v2(ssh_key.passphrase)}`")
                 os.remove(private_key_path)
 
+    async def get_or_create_console_connection_handler(self, update: Update,
+                                                       context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Get console connection for an instance, create one with master SSH key if not exists."""
+        if context.args is None or len(context.args) < 2:
+            await update.message.reply_markdown_v2(
+                text=f"parameter error: `/console_connection <profile> <instance_name>`",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        oci_profile = context.args[0]
+        instance_name = context.args[1]
+
+        instance = self.get_instance(oci_profile, instance_name)
+        if isinstance(instance, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to get instance `{escape_markdown_v2(instance_name)}`, '
+                     f'details: `{escape_markdown_v2(str(instance))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        if instance.lifecycle_state in ["TERMINATED", "TERMINATING"]:
+            await update.message.reply_markdown_v2(
+                text=f'instance `{escape_markdown_v2(instance_name)}` is terminated or terminating',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        oci_client = self.oci_client(oci_profile)
+
+        # Try to get existing console connection first
+        console_connection = oci_client.instance_console_connection(instance)
+        if not isinstance(console_connection, Status):
+            # Found existing active console connection
+            text = (f"✅ Console connection for `{escape_markdown_v2(instance_name)}` found:\n"
+                    f"    🔗SSH for `macOS/Linux`\n"
+                    f"```bash\n"
+                    f"{escape_markdown_v2(console_connection.connection_string)}\n"
+                    "```\n"
+                    f"    🔗VNC connection for `macOS/Linux`\n"
+                    f"```bash\n"
+                    f"{escape_markdown_v2(console_connection.vnc_connection_string)}\n"
+                    "```\n")
+            await update.message.reply_markdown_v2(text=text, reply_to_message_id=update.message.message_id)
+            return
+
+        # No existing console connection, create a new one with master SSH key
+        public_key = self.master_ssh_authorize_keys
+        ssh_key = None
+        if public_key is None:
+            ssh_key = generate_ssh_key()
+            public_key = ssh_key.public_key
+            await update.message.reply_markdown_v2(
+                text=f"`master_ssh_authorize_keys` is not set, generating a new SSH key",
+                reply_to_message_id=update.message.message_id)
+
+        await update.message.reply_markdown_v2(
+            text=f"No active console connection found for `{escape_markdown_v2(instance_name)}`, creating one\\.\\.\\.",
+            reply_to_message_id=update.message.message_id)
+
+        result = oci_client.create_console_connection(instance_id=instance.id, public_key=public_key)
+        if isinstance(result, Status):
+            await update.message.reply_markdown_v2(
+                text=f'fail to create console connection for instance `{escape_markdown_v2(instance_name)}`, '
+                     f'details: `{escape_markdown_v2(str(result))}`',
+                reply_to_message_id=update.message.message_id)
+            return
+
+        connection = result
+        message = await update.message.reply_markdown_v2(
+            text=f"Console connection for instance `{escape_markdown_v2(instance_name)}` created, please wait\\.\\.\\.",
+            reply_to_message_id=update.message.message_id)
+
+        # Wait for console connection to be ready
+        result = oci_client.wait_for_console_connection(instance=instance,
+                                                        console_connection=connection,
+                                                        exiting=self.exiting)
+        if isinstance(result, Status):
+            await message.edit_text(f"fail to wait for console connection to be ready, "
+                                    f"details: `{escape_markdown_v2(str(result))}`", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        console_connection = result
+        text = (f"✅ Console connection for `{escape_markdown_v2(instance_name)}` is ready:\n"
+                f"    🔗SSH for `macOS/Linux`\n"
+                f"```bash\n"
+                f"{escape_markdown_v2(console_connection.connection_string)}\n"
+                "```\n"
+                f"    🔗VNC connection for `macOS/Linux`\n"
+                f"```bash\n"
+                f"{escape_markdown_v2(console_connection.vnc_connection_string)}\n"
+                "```\n")
+        await message.edit_text(text=text, parse_mode=ParseMode.MARKDOWN_V2)
+
+        # Send private key if generated
+        if ssh_key is not None:
+            private_key_path = ssh_key.save()
+            if private_key_path is not None:
+                await message.reply_document(document=open(private_key_path, 'rb'),
+                                             filename=f"{instance_name}.pem",
+                                             parse_mode=ParseMode.MARKDOWN_V2,
+                                             caption=f"private key for console connection of instance `{instance_name}`"
+                                                     f", passphrase is `{escape_markdown_v2(ssh_key.passphrase)}`")
+                os.remove(private_key_path)
+
     @staticmethod
     async def ping_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if context.args is None or len(context.args) < 1:
@@ -7265,70 +7372,71 @@ class TelegramCommandBot:
             f"welcome to use oracle bot, "
         prefix += f"here are the available commands:\n"
         await update.message.reply_markdown_v2(
-            text=prefix + f"```bash\n"
+            text=prefix + f"```\n"
                           # Profile Management
                           f"# Profile Management\n"
-                          f"/profiles                    \\- list profiles\n"
-                          f"/add\\_profile                \\- add new profile\n"
-                          f"/cancel                      \\- cancel add\\_profile\n"
-                          f"/delete\\_profiles \\<profiles\\> \\- delete profiles\n"
-                          f"/mark\\_dead \\<profile\\> \\<dead\\|alive\\> \\- mark dead/alive\n"
-                          f"/tenancy \\[profiles\\]        \\- show tenancy info\n"
+                          f"/profiles                              \\- list profiles\n"
+                          f"/add\\_profile                           \\- add new profile\n"
+                          f"/cancel                                \\- cancel add\\_profile\n"
+                          f"/delete\\_profiles <profiles>            \\- delete profiles\n"
+                          f"/mark\\_dead <profile> <dead|alive>      \\- mark dead/alive\n"
+                          f"/tenancy [profiles]                    \\- show tenancy info\n"
                           f"\n"
                           # Instance Management
                           f"# Instance Management\n"
-                          f"/instances \\[profiles\\]      \\- list instances\n"
-                          f"/instance\\_details \\<profile\\> \\<name\\> \\- details\n"
-                          f"/create\\_instance \\<profile\\> \\<shape\\> \\<cfg\\> \\- create\n"
-                          f"/rename\\_instance \\<profile\\> \\<old\\> \\<new\\> \\- rename\n"
-                          f"/resize\\_instance \\<profile\\> \\<name\\> \\<cfg\\> \\- resize\n"
-                          f"/delete\\_instance \\<profile\\> \\<name\\> \\- delete\n"
-                          f"/start\\_instance \\<profile\\> \\<name\\> \\- start\n"
-                          f"/instance\\_action \\<profile\\> \\<name\\> \\<act\\> \\- action\n"
-                          f"/ping\\_instance \\<profile\\> \\<name\\> \\- ping instance\n"
-                          f"/ping \\<hosts\\>              \\- ping hosts\n"
+                          f"/instances [profiles]                  \\- list instances\n"
+                          f"/instance\\_details <profile> <name>     \\- details\n"
+                          f"/create\\_instance <profile> <shape> \\.\\.\\.  \\- create\n"
+                          f"/rename\\_instance <profile> <old> <new> \\- rename\n"
+                          f"/resize\\_instance <profile> <name> \\.\\.\\.   \\- resize\n"
+                          f"/delete\\_instance <profile> <name>      \\- delete\n"
+                          f"/start\\_instance <profile> <name>       \\- start\n"
+                          f"/instance\\_action <profile> <name> \\.\\.\\.  \\- action\n"
+                          f"/ping\\_instance <profile> <name>        \\- ping instance\n"
+                          f"/ping <hosts>                          \\- ping hosts\n"
                           f"\n"
                           # Volume Management
                           f"# Volume Management\n"
-                          f"/volumes \\[profiles\\]        \\- list volumes\n"
-                          f"/attach\\_volume \\<profile\\> \\<inst\\> \\<vol\\> \\- attach\n"
-                          f"/detach\\_volume \\<profile\\> \\<inst\\> \\<vol\\> \\- detach\n"
-                          f"/resize\\_boot\\_volume \\<profile\\> \\<name\\> \\<size\\> \\- resize\n"
+                          f"/volumes [profiles]                    \\- list volumes\n"
+                          f"/attach\\_volume <profile> <inst> <vol>  \\- attach\n"
+                          f"/detach\\_volume <profile> <inst> <vol>  \\- detach\n"
+                          f"/resize\\_boot\\_volume <profile> \\.\\.\\.      \\- resize\n"
                           f"\n"
                           # Console Connection
                           f"# Console Connection\n"
-                          f"/console\\_connections \\<profile\\> \\[names\\] \\- list\n"
-                          f"/create\\_console\\_connection \\<profile\\> \\<name\\> \\- create\n"
+                          f"/console\\_connection <profile> <name>    \\- get/create\n"
+                          f"/console\\_connections <profile> [names] \\- list all\n"
+                          f"/create\\_console\\_connection <profile>   \\- force create\n"
                           f"\n"
                           # Network Management
                           f"# Network Management\n"
-                          f"/change\\_ip \\<profile\\> \\<name\\> \\[type\\] \\- change IP\n"
-                          f"/delete\\_ipv6s \\<profile\\> \\<name\\> \\[ipv6\\] \\- delete IPv6\n"
-                          f"/allow\\_ports \\<profile\\> \\<IN\\|OUT\\> \\<ports\\> \\- add rules\n"
-                          f"/clear\\_security\\_lists \\<profile\\> \\- clear rules\n"
+                          f"/change\\_ip <profile> <name> [type]     \\- change IP\n"
+                          f"/delete\\_ipv6s <profile> <name> [ipv6]  \\- delete IPv6\n"
+                          f"/allow\\_ports <profile> <dir> <ports>   \\- add rules\n"
+                          f"/clear\\_security\\_lists <profile>        \\- clear rules\n"
                           f"\n"
                           # DNS/Cloudflare
                           f"# DNS/Cloudflare\n"
-                          f"/dns\\_records \\<profile\\> \\<name\\> \\- list DNS records\n"
-                          f"/cf\\_records \\[filters\\]      \\- list CF records\n"
-                          f"/add\\_cf\\_record \\<domain\\> \\<ip\\> \\- add CF record\n"
-                          f"/create\\_cf\\_record \\<domain\\> \\<ip\\> \\- alias add\\_cf\n"
-                          f"/update\\_cf\\_record \\<domain\\> \\<ip\\> \\- update CF\n"
-                          f"/delete\\_cf\\_records \\<ip\\|domain\\> \\- delete CF\n"
+                          f"/dns\\_records <profile> <name>          \\- list DNS records\n"
+                          f"/cf\\_records [filters]                  \\- list CF records\n"
+                          f"/add\\_cf\\_record <domain> <ip>           \\- add CF record\n"
+                          f"/create\\_cf\\_record <domain> <ip>        \\- alias add\\_cf\n"
+                          f"/update\\_cf\\_record <domain> <ip>        \\- update CF\n"
+                          f"/delete\\_cf\\_records <ip|domain>         \\- delete CF\n"
                           f"\n"
                           # Task Management
                           f"# Task Management\n"
-                          f"/tasks                       \\- list tasks\n"
-                          f"/pause\\_task \\<task\\_id\\>      \\- pause task\n"
-                          f"/start\\_task \\<task\\_id\\>      \\- start/resume task\n"
-                          f"/abort\\_task \\<task\\_id\\>      \\- abort task\n"
-                          f"/abandon\\_task \\<task\\_id\\>    \\- alias abort\\_task\n"
+                          f"/tasks                                 \\- list tasks\n"
+                          f"/pause\\_task <task\\_id>                  \\- pause task\n"
+                          f"/start\\_task <task\\_id>                  \\- start/resume\n"
+                          f"/abort\\_task <task\\_id>                  \\- abort task\n"
+                          f"/abandon\\_task <task\\_id>                \\- alias abort\n"
                           f"\n"
                           # System
                           f"# System\n"
-                          f"/sysinfo                     \\- system info\n"
-                          f"/alive \\[profiles\\]          \\- alive check\n"
-                          f"/help                        \\- show this help\n"
+                          f"/sysinfo                               \\- system info\n"
+                          f"/alive [profiles]                      \\- alive check\n"
+                          f"/help                                  \\- show this help\n"
                           f"```",
             reply_to_message_id=update.message.message_id)
 
