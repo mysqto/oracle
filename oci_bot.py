@@ -129,6 +129,24 @@ def in_country(region: dict, country_code: str) -> bool:
     return region['country_code'] == country_code.upper()
 
 
+def get_all_cities() -> set:
+    """Get all unique city names from oci_regions (case-insensitive)."""
+    # Import here to avoid circular reference, will be populated after oci_regions is defined
+    return {region['city'].lower() for region in oci_regions.values()}
+
+
+def is_city_name(s: str) -> bool:
+    """Check if a string matches a city name (case-insensitive)."""
+    return s.lower() in get_all_cities()
+
+
+def in_city(region: dict, city_name: str) -> bool:
+    """Check if a region is in a specific city (case-insensitive)."""
+    if region is None:
+        return False
+    return region['city'].lower() == city_name.lower()
+
+
 __base_dir__ = ".oci"
 
 skip_prefixes = [
@@ -4728,6 +4746,12 @@ class TelegramCommandBot:
         oci_region = oci_regions.get(self.oci_client(oci_profile).oci_config.region)
         return in_country(oci_region, country_code)
 
+    def in_city(self, oci_profile, city_name) -> bool:
+        if oci_profile not in self.oci_clients:
+            return False
+        oci_region = oci_regions.get(self.oci_client(oci_profile).oci_config.region)
+        return in_city(oci_region, city_name)
+
     def warmup_connections_sync(self):
         """Pre-warm OCI connections by making a lightweight API call to each profile (synchronous version)"""
         logger.info(f"Starting background warmup for {len(self.oci_clients)} profiles...")
@@ -5803,10 +5827,11 @@ class TelegramCommandBot:
             oci_profiles = self.oci_clients.keys()
         else:
             not_found = [oci_profile for oci_profile in oci_profiles if oci_profile not
-                         in self.oci_clients.keys() and not is_country_code(oci_profile)]
+                         in self.oci_clients.keys() and not is_country_code(oci_profile)
+                         and not is_city_name(oci_profile)]
 
+            # Handle country code filtering
             countries = [oci_profile for oci_profile in oci_profiles if is_country_code(oci_profile)]
-
             if len(countries) > 0:
                 for country in countries:
                     oci_profiles.remove(country)
@@ -5816,6 +5841,18 @@ class TelegramCommandBot:
                         oci_profiles.extend(profiles)
                     else:
                         not_found.append(country)
+
+            # Handle city name filtering
+            cities = [oci_profile for oci_profile in oci_profiles if is_city_name(oci_profile)]
+            if len(cities) > 0:
+                for city_name in cities:
+                    oci_profiles.remove(city_name)
+                    profiles = [oci_profile for oci_profile in
+                                self.oci_clients.keys() if self.in_city(oci_profile, city_name)]
+                    if len(profiles) > 0:
+                        oci_profiles.extend(profiles)
+                    else:
+                        not_found.append(city_name)
 
             # remove all duplicates
             oci_profiles = list(set(oci_profiles))
@@ -7384,7 +7421,7 @@ class TelegramCommandBot:
                           f"\n"
                           # Instance Management
                           f"# Instance Management\n"
-                          f"/instances [profiles]                  \\- list instances\n"
+                          f"/instances [profiles|country|city]     \\- list instances\n"
                           f"/instance\\_details <profile> <name>     \\- details\n"
                           f"/create\\_instance <profile> <shape> \\.\\.\\.  \\- create\n"
                           f"/rename\\_instance <profile> <old> <new> \\- rename\n"
