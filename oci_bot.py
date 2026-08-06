@@ -52,11 +52,12 @@ from oci.core.models import Instance, Subnet, Shape, Image, Vcn, Vnic, Ipv6, Pub
 from oci.database.models import ConsoleConnection
 from oci.exceptions import InvalidPrivateKey, MissingPrivateKeyPassphrase, ServiceError
 from oci.identity import IdentityClient
-from oci.identity.models import Tenancy, Region
+from oci.identity.models import Tenancy, Region, RegionSubscription
 from oci.limits import LimitsClient
 from oci.limits.models import LimitValueSummary, ServiceSummary
 from oci.object_storage import ObjectStorageClient
 from oci.object_storage.models import CreateBucketDetails, Bucket
+from oci.tenant_manager_control_plane import SubscriptionClient
 from oci.util import to_dict
 from telegram import Update, User
 from telegram.constants import ParseMode, ChatType
@@ -204,6 +205,14 @@ def readable_size(n, base_unit='B', fmt="%(value).1f%(symbol)s"):
 
     index = _symbols.index(base_unit)
     return readable_bytes(n * (1024 ** index), fmt)
+
+
+def readable_date(value) -> str:
+    if value is None:
+        return "unknown"
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
 
 
 async def ping(host, ipv6=False, count=8, markdown=True) -> str:
@@ -1038,6 +1047,249 @@ class InstanceLimit:
             self.cpu_cores, self.memory_in_gbs, self.boot_volume_size_in_gbs)
 
 
+class Subscription:
+    """Normalized view of a single account subscription
+
+    The tenant manager control plane returns either a classic (V1) or a cloud (V2) subscription,
+    only the classic one carries promotion (free tier trial) details, so every field is optional.
+    """
+    __id__ = None
+    __service_name__ = None
+    __lifecycle_state__ = None
+    __entity_version__ = None
+    __payment_model__ = None
+    __subscription_tier__ = None
+    __subscription_number__ = None
+    __start_date__ = None
+    __end_date__ = None
+    __promotions__ = []
+
+    def __init__(self, subscription):
+        self.id = getattr(subscription, 'id', None)
+        self.service_name = getattr(subscription, 'service_name', None)
+        self.lifecycle_state = getattr(subscription, 'lifecycle_state', None)
+        self.entity_version = getattr(subscription, 'entity_version', None)
+        self.payment_model = getattr(subscription, 'payment_model', None)
+        self.subscription_tier = getattr(subscription, 'subscription_tier', None)
+        self.subscription_number = (getattr(subscription, 'csi_number', None) or
+                                    getattr(subscription, 'subscription_number', None))
+        self.start_date = getattr(subscription, 'start_date', None)
+        self.end_date = getattr(subscription, 'end_date', None)
+        self.promotions = getattr(subscription, 'promotion', None) or []
+
+    @property
+    def id(self):
+        return self.__id__
+
+    @id.setter
+    def id(self, subscription_id):
+        self.__id__ = subscription_id
+
+    @property
+    def service_name(self):
+        return self.__service_name__
+
+    @service_name.setter
+    def service_name(self, service_name):
+        self.__service_name__ = service_name
+
+    @property
+    def lifecycle_state(self):
+        return self.__lifecycle_state__
+
+    @lifecycle_state.setter
+    def lifecycle_state(self, lifecycle_state):
+        self.__lifecycle_state__ = lifecycle_state
+
+    @property
+    def entity_version(self):
+        return self.__entity_version__
+
+    @entity_version.setter
+    def entity_version(self, entity_version):
+        self.__entity_version__ = entity_version
+
+    @property
+    def payment_model(self):
+        return self.__payment_model__
+
+    @payment_model.setter
+    def payment_model(self, payment_model):
+        self.__payment_model__ = payment_model
+
+    @property
+    def subscription_tier(self):
+        return self.__subscription_tier__
+
+    @subscription_tier.setter
+    def subscription_tier(self, subscription_tier):
+        self.__subscription_tier__ = subscription_tier
+
+    @property
+    def subscription_number(self):
+        return self.__subscription_number__
+
+    @subscription_number.setter
+    def subscription_number(self, subscription_number):
+        self.__subscription_number__ = subscription_number
+
+    @property
+    def start_date(self):
+        return self.__start_date__
+
+    @start_date.setter
+    def start_date(self, start_date):
+        self.__start_date__ = start_date
+
+    @property
+    def end_date(self):
+        return self.__end_date__
+
+    @end_date.setter
+    def end_date(self, end_date):
+        self.__end_date__ = end_date
+
+    @property
+    def promotions(self):
+        return self.__promotions__
+
+    @promotions.setter
+    def promotions(self, promotions):
+        self.__promotions__ = promotions
+
+    @property
+    def promotion(self):
+        """The free tier promotion of the account, if any"""
+        if len(self.promotions) == 0:
+            return None
+        return self.promotions[0]
+
+    @property
+    def promotion_status(self):
+        promotion = self.promotion
+        return None if promotion is None else promotion.status
+
+    @property
+    def is_free_tier(self):
+        return len(self.promotions) > 0
+
+    @property
+    def upgraded(self):
+        """Account is on a paid plan, or the owner declared the intent to pay"""
+        promotion = self.promotion
+        return (self.payment_model == 'PAY_AS_YOU_GO' or
+                (promotion is not None and bool(promotion.is_intent_to_pay)))
+
+    @property
+    def active(self):
+        return self.lifecycle_state is None or self.lifecycle_state == 'ACTIVE'
+
+    @property
+    def expires_at(self):
+        promotion = self.promotion
+        if promotion is not None and promotion.time_expired is not None:
+            return promotion.time_expired
+        return self.end_date
+
+    @property
+    def days_left(self):
+        """Days until the promotion (or the subscription itself) expires, None when unknown"""
+        expires_at = self.expires_at
+        if expires_at is None:
+            return None
+        # compare on epoch seconds, OCI returns timezone aware datetime
+        return int((expires_at.timestamp() - time.time()) // 86400)
+
+    @property
+    def tier(self):
+        if self.payment_model is not None:
+            return self.payment_model
+        if self.subscription_tier is not None:
+            return self.subscription_tier
+        # the assigned subscription carries no payment model, fall back to the promotion
+        if self.upgraded:
+            return 'PAY_AS_YOU_GO'
+        if self.is_free_tier:
+            return 'FREE_TIER'
+        return 'UNKNOWN'
+
+    @property
+    def state(self):
+        """Short human readable state, used by /alive and /tenancy"""
+        if not self.active:
+            return f'⛔{self.lifecycle_state}'
+        days_left = self.days_left
+        if self.promotion_status == 'ACTIVE':
+            if days_left is None:
+                return '✅Trial'
+            if days_left <= 7:
+                return f'⚠️Trial {days_left}d left'
+            return f'✅Trial {days_left}d left'
+        if self.upgraded:
+            return '✅Paid'
+        if self.is_free_tier:
+            return '♻️Always Free'
+        return '✅Active'
+
+    def __str__(self):
+        return '{"service_name": "%s", "tier": "%s", "lifecycle_state": "%s", "promotion": "%s", "expires": "%s"}' % (
+            self.service_name, self.tier, self.lifecycle_state, self.promotion_status, readable_date(self.expires_at))
+
+
+class AccountSubscription:
+    """Subscription state of an OCI account: the account subscriptions plus the subscribed regions"""
+    __subscriptions__ = []
+    __regions__ = []
+
+    def __init__(self, subscriptions=None, regions=None):
+        self.subscriptions = subscriptions if subscriptions is not None else []
+        self.regions = regions if regions is not None else []
+
+    @property
+    def subscriptions(self):
+        return self.__subscriptions__
+
+    @subscriptions.setter
+    def subscriptions(self, subscriptions):
+        self.__subscriptions__ = subscriptions
+
+    @property
+    def regions(self):
+        return self.__regions__
+
+    @regions.setter
+    def regions(self, regions):
+        self.__regions__ = regions
+
+    @property
+    def primary(self) -> Subscription | None:
+        """The subscription the account actually runs on, the tenancy has exactly one in practice"""
+        if len(self.subscriptions) == 0:
+            return None
+        return self.subscriptions[0]
+
+    @property
+    def home_region(self):
+        for region in self.regions:
+            if region.is_home_region:
+                return region.region_name
+        return None
+
+    @property
+    def region_names(self):
+        return [region.region_name for region in self.regions]
+
+    @property
+    def state(self):
+        primary = self.primary
+        # no subscription visible: the tenancy has no access to the subscription API
+        return '❓Unknown' if primary is None else primary.state
+
+    def __str__(self):
+        return '{"state": "%s", "home_region": "%s", "regions": %d}' % (
+            self.state, self.home_region, len(self.regions))
+
+
 class IPAddress:
     __v4__ = None
     __v6s__ = []
@@ -1552,6 +1804,7 @@ class OCIClient:
     __block_storage_client__ = None
     __object_storage_client__ = None
     __identity_client__ = None
+    __subscription_client__ = None
     __client_name__ = None
     __telegram_bot__ = None
     __telegram_admin_chat_id__ = None
@@ -1721,6 +1974,21 @@ class OCIClient:
     @identity_client.setter
     def identity_client(self, identity_client):
         self.__identity_client__ = identity_client
+
+    @property
+    def subscription_client(self):
+        """Lazy initialization of SubscriptionClient, the subscription API only serves the home region"""
+        if self.__subscription_client__ is None:
+            config = dict(self.oci_config)
+            home_region = self.home_region()
+            if home_region is not None:
+                config['region'] = home_region
+            self.__subscription_client__ = SubscriptionClient(config=config)
+        return self.__subscription_client__
+
+    @subscription_client.setter
+    def subscription_client(self, subscription_client):
+        self.__subscription_client__ = subscription_client
 
     @property
     def compartment_id(self):
@@ -3341,6 +3609,83 @@ class OCIClient:
             self.handle_api_result(result)
             return result
 
+    def list_region_subscriptions(self) -> list[RegionSubscription] | Status:
+        # Skip dead profiles to avoid wasting time
+        if self.is_dead:
+            return Status(http.client.UNAUTHORIZED, "ProfileDead",
+                          f"Profile marked as dead after {self.auth_failure_count} auth failures")
+
+        try:
+            regions = self.identity_client.list_region_subscriptions(self.compartment_id).data
+            # Successful call - reset failure counter
+            self.reset_auth_failures()
+            return regions
+        except ServiceError as e:
+            result = Status(e.status, e.code, e.message)
+            # Check and handle authentication failures
+            self.handle_api_result(result)
+            return result
+
+    def home_region(self) -> str | None:
+        """Home region name of the tenancy, required by the home region only services"""
+        cached = self._get_cached_method_result('home_region', self.compartment_id, ttl=3600)
+        if cached is not None:
+            return cached
+
+        regions = self.list_region_subscriptions()
+        if isinstance(regions, Status):
+            self.warning(f"fail to get home region, details: {regions}")
+            return None
+
+        for region in regions:
+            if region.is_home_region:
+                self._set_cached_method_result('home_region', self.compartment_id, region.region_name)
+                return region.region_name
+        return None
+
+    def list_subscriptions(self) -> list[Subscription] | Status:
+        """List the subscriptions assigned to the tenancy, with promotion details when available
+
+        Auth failures are not counted here: plenty of healthy tenancies simply have no policy
+        granting access to the subscription API, marking those profiles dead would be wrong.
+        """
+        if self.is_dead:
+            return Status(http.client.UNAUTHORIZED, "ProfileDead",
+                          f"Profile marked as dead after {self.auth_failure_count} auth failures")
+
+        try:
+            assigned = self.subscription_client.list_assigned_subscriptions(
+                compartment_id=self.compartment_id).data.items
+        except ServiceError as e:
+            return Status(e.status, e.code, e.message)
+        except Exception as e:
+            return Status(http.client.INTERNAL_SERVER_ERROR, "SubscriptionClientError", str(e))
+
+        subscriptions = []
+        for summary in assigned:
+            # the summary carries no promotion, only the detail call tells free tier from paid
+            detail = summary
+            try:
+                detail = self.subscription_client.get_assigned_subscription(summary.id).data
+            except ServiceError as e:
+                self.warning(f"fail to get subscription detail of {summary.id}, details: {e.message}")
+            subscriptions.append(Subscription(detail))
+        return subscriptions
+
+    def get_subscription(self) -> AccountSubscription | Status:
+        """Subscription state of the account: the account subscriptions plus the subscribed regions"""
+        regions = self.list_region_subscriptions()
+        if isinstance(regions, Status):
+            return regions
+
+        subscriptions = self.list_subscriptions()
+        if isinstance(subscriptions, Status):
+            # the region subscriptions are still worth reporting on their own
+            self.warning(f"fail to list subscriptions, details: {subscriptions}")
+            subscriptions = []
+
+        return AccountSubscription(subscriptions=subscriptions, regions=regions)
+
     def list_subnets(self, vcn_id=None) -> list[Subnet] | Status:
         try:
             return self.network_client.list_subnets(self.compartment_id, vcn_id=vcn_id).data
@@ -4511,6 +4856,7 @@ class TelegramCommandBot:
         self._clear_cache(f"volumes_{profile_name}")
         self._clear_cache(f"boot_volumes_{profile_name}")
         self._clear_cache(f"live_check_{profile_name}")
+        self._clear_cache(f"subscription_{profile_name}")
         logger.debug(f"Cleared cache for profile: {profile_name}")
     
     def load_dead_profiles(self):
@@ -4890,6 +5236,8 @@ class TelegramCommandBot:
         # on different commands - answer in Telegram
         self.telegram_bot.add_handler(TypeHandler(Update, self.permission_handler), group=-1)
         self.telegram_bot.add_handler(CommandHandler("tenancy", self.tenancy_handler))
+        self.telegram_bot.add_handler(CommandHandler("subscription", self.subscription_handler))
+        self.telegram_bot.add_handler(CommandHandler("subscriptions", self.subscription_handler))
         self.telegram_bot.add_handler(CommandHandler("instances", self.list_instances_handler))
         self.telegram_bot.add_handler(CommandHandler("profiles", self.list_profiles_handler))
         self.telegram_bot.add_handler(CommandHandler("delete_profiles", self.delete_profiles_handler))
@@ -5144,6 +5492,45 @@ class TelegramCommandBot:
             self._set_cache(cache_key, tenancy)
             return profile_name, tenancy
 
+    async def subscription(self, profile_name):
+        # Check if profile is dead
+        oci_client = self.oci_clients.get(profile_name)
+        if oci_client is None:
+            return profile_name, Status(http.client.BAD_REQUEST,
+                                        "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        if oci_client.is_dead:
+            return profile_name, Status(http.client.UNAUTHORIZED, "ProfileDead",
+                                        f"Profile marked as dead after {oci_client.auth_failure_count} auth failures")
+
+        cache_key = f"subscription_{profile_name}"
+        cached = self._get_cached(cache_key, ttl=1800)  # 30 min cache (subscription rarely changes)
+        if cached is not None:
+            return profile_name, cached
+
+        # Wait for profile to be ready if warmup is still in progress
+        if not self.is_profile_ready(profile_name):
+            logger.debug(f"Profile {profile_name} not ready yet, waiting...")
+            ready = await self.wait_for_profile_ready(profile_name, timeout=10.0)
+            if not ready:
+                logger.warning(f"Profile {profile_name} still not ready after timeout, proceeding anyway")
+
+        # Use semaphore to limit concurrent OCI API calls
+        async with self.semaphore:
+            subscription = await asyncio.to_thread(oci_client.get_subscription)
+            self._set_cache(cache_key, subscription)
+            return profile_name, subscription
+
+    async def subscription_state(self, profile_name):
+        """Short subscription state for the alive check, empty when the account tells us nothing"""
+        try:
+            _, subscription = await self.subscription(profile_name)
+        except Exception as ex:
+            logger.warning(f"fail to get subscription for profile {profile_name}, details: {ex}")
+            return ''
+        if isinstance(subscription, Status) or subscription.primary is None:
+            return ''
+        return f' ({subscription.state})'
+
     async def live_check(self, profile_name):
         """Run the synchronous OCI call in a thread for true async execution with caching and rate limiting"""
         cache_key = f"live_check_{profile_name}"
@@ -5188,7 +5575,8 @@ class TelegramCommandBot:
                 else:
                     result = (display_name, '☢️Danger')
             else:
-                result = (display_name, '👍Alive')
+                # reachable, so tell an expired subscription apart from a dead profile
+                result = (display_name, f'👍Alive{await self.subscription_state(profile_name)}')
             self._set_cache(cache_key, result)
             return result
         except Exception as ex:
@@ -5802,23 +6190,139 @@ class TelegramCommandBot:
         return await self.add_profile(update, context)
 
     async def tenancy_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        profiles = context.args if len(context.args) > 0 else self.oci_clients.keys()
+        profiles = list(context.args) if len(context.args) > 0 else list(self.oci_clients.keys())
         tasks = [self.tenancy(profile) for profile in profiles]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        subscriptions = await self.subscriptions(profiles)
 
         message = f"*Tenancy*:\n"
         for result in results:
             profile_name, tenancy = result
             message += f"{self.flag(profile_name)} `{profile_name}`:\n"
             if isinstance(tenancy, Status):
-                message += f"  •  fail to get tenancy: `{escape_markdown_v2(str(result))}`\n"
+                message += f"  •  fail to get tenancy: `{escape_markdown_v2(str(tenancy))}`\n"
                 continue
+            subscription = subscriptions.get(profile_name)
             message += f"```bash\n"
             message += f"  •  id: {tenancy.id}\n"
             message += f"  •  name: {tenancy.name}\n"
             message += f"  •  home region: {tenancy.home_region_key}\n"
+            if subscription is not None and not isinstance(subscription, Status):
+                message += f"  •  subscription: {subscription.state}\n"
+                message += f"  •  regions: {len(subscription.regions)} subscribed\n"
             message += f"```\n"
         await update.message.reply_markdown_v2(text=message, reply_to_message_id=update.message.message_id)
+
+    async def subscriptions(self, profiles) -> dict:
+        """Subscription state of every given profile, keyed by profile name"""
+        tasks = [self.subscription(profile) for profile in profiles]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        subscriptions = {}
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning(f"fail to get subscription, details: {result}")
+                continue
+            profile_name, subscription = result
+            subscriptions[profile_name] = subscription
+        return subscriptions
+
+    def resolve_profiles(self, args) -> tuple[list[str], list[str]]:
+        """Resolve command arguments into profile names, accepting country codes and city names"""
+        if args is None or len(args) == 0:
+            return list(self.oci_clients.keys()), []
+
+        oci_profiles = list(args)
+        not_found = [oci_profile for oci_profile in oci_profiles if oci_profile not
+                     in self.oci_clients.keys() and not is_country_code(oci_profile)
+                     and not is_city_name(oci_profile)]
+
+        # Handle country code filtering
+        countries = [oci_profile for oci_profile in oci_profiles if is_country_code(oci_profile)]
+        for country in countries:
+            oci_profiles.remove(country)
+            profiles = [oci_profile for oci_profile in
+                        self.oci_clients.keys() if self.in_country(oci_profile, country)]
+            if len(profiles) > 0:
+                oci_profiles.extend(profiles)
+            else:
+                not_found.append(country)
+
+        # Handle city name filtering
+        cities = [oci_profile for oci_profile in oci_profiles if is_city_name(oci_profile)]
+        for city_name in cities:
+            oci_profiles.remove(city_name)
+            profiles = [oci_profile for oci_profile in
+                        self.oci_clients.keys() if self.in_city(oci_profile, city_name)]
+            if len(profiles) > 0:
+                oci_profiles.extend(profiles)
+            else:
+                not_found.append(city_name)
+
+        # remove all duplicates and everything we could not resolve
+        oci_profiles = [oci_profile for oci_profile in set(oci_profiles) if oci_profile not in not_found]
+        return oci_profiles, not_found
+
+    async def subscription_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        oci_profiles, not_found = self.resolve_profiles(context.args)
+
+        if len(not_found) > 0:
+            await update.message.reply_markdown_v2(
+                text=f"profile not found: {markdown_list(not_found)}",
+                reply_to_message_id=update.message.message_id)
+        if len(oci_profiles) == 0:
+            return
+
+        subscriptions = await self.subscriptions(oci_profiles)
+        results = sorted(subscriptions.items(), key=lambda x: f'{self.flagged_city(x[0])}{x[0]}')
+
+        # group results by 5 to stay under Telegram's message size limit
+        for i in range(0, len(results), 5):
+            current_results = results[i:i + 5 if i + 5 < len(results) else len(results)]
+            message = f"*Subscription*:\n"
+            for profile_name, subscription in current_results:
+                message += f"*`{self.flagged_city(profile_name)} \\- {escape_markdown_v2(profile_name)}`*\n"
+                if isinstance(subscription, Status):
+                    message += f"  •  fail to get subscription: `{escape_markdown_v2(str(subscription))}`\n"
+                    continue
+
+                message += f"```bash\n"
+                message += f"  •  state: {subscription.state}\n"
+                primary = subscription.primary
+                if primary is None:
+                    message += f"  •  account: no subscription visible, check the tenancy policies\n"
+                else:
+                    message += f"  •  service: {primary.service_name}\n"
+                    message += f"  •  tier: {primary.tier}\n"
+                    message += f"  •  lifecycle: {primary.lifecycle_state}\n"
+                    if primary.subscription_number is not None:
+                        message += f"  •  number: {primary.subscription_number}\n"
+                    if primary.promotion is not None:
+                        message += f"  •  promotion: {primary.promotion_status}\n"
+                    message += f"  •  started: {readable_date(primary.start_date)}\n"
+                    if primary.expires_at is not None:
+                        days_left = primary.days_left
+                        if days_left is not None and days_left < 0:
+                            message += f"  •  promotion ended: {readable_date(primary.expires_at)}\n"
+                        else:
+                            message += (f"  •  expires: {readable_date(primary.expires_at)} "
+                                        f"({days_left}d left)\n")
+                    if len(subscription.subscriptions) > 1:
+                        message += f"  •  other subscriptions: {len(subscription.subscriptions) - 1}\n"
+
+                home_region = subscription.home_region
+                message += f"  •  home region: {home_region if home_region is not None else 'unknown'}\n"
+                message += f"  •  regions ({len(subscription.regions)}):\n"
+                for region in sorted(subscription.regions, key=lambda x: x.region_name):
+                    marker = " (home)" if region.is_home_region else ""
+                    ready = "✅" if region.status == 'READY' else "⌛"
+                    message += f"       {ready} {region.region_name}{marker}\n"
+                message += f"```\n"
+
+            if i == 0:
+                await update.message.reply_markdown_v2(
+                    text=message, reply_to_message_id=update.message.message_id)
+            else:
+                await update.message.reply_markdown_v2(text=message)
 
     async def list_instances_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         oci_profiles = context.args
@@ -7418,6 +7922,8 @@ class TelegramCommandBot:
                           f"/delete\\_profiles <profiles>            \\- delete profiles\n"
                           f"/mark\\_dead <profile> <dead|alive>      \\- mark dead/alive\n"
                           f"/tenancy [profiles]                    \\- show tenancy info\n"
+                          f"/subscription [profiles]               \\- subscription state\n"
+                          f"/subscriptions [profiles]              \\- alias subscription\n"
                           f"\n"
                           # Instance Management
                           f"# Instance Management\n"
