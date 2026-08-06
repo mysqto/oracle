@@ -57,6 +57,7 @@ from oci.limits import LimitsClient
 from oci.limits.models import LimitValueSummary, ServiceSummary
 from oci.object_storage import ObjectStorageClient
 from oci.object_storage.models import CreateBucketDetails, Bucket
+from oci.pagination import list_call_get_all_results
 from oci.tenant_manager_control_plane import SubscriptionClient
 from oci.util import to_dict
 from telegram import Update, User
@@ -1137,6 +1138,10 @@ class ResourceLimit:
         total = self.total
         if total is None:
             return f'{readable_number(self.used)} used'
+        if self.available is not None and self.available < 0:
+            # the account is running more than the limit now allows, Oracle trims these
+            return (f'{readable_number(self.used)}/{readable_number(total)} used, '
+                    f'over by {readable_number(-self.available)}')
         return (f'{readable_number(self.used)}/{readable_number(total)} used, '
                 f'{readable_number(self.available)} free')
 
@@ -1327,6 +1332,9 @@ class Subscription:
         """Short human readable state, used by /alive and /tenancy"""
         if not self.active:
             return f'⛔{self.lifecycle_state}'
+        # an upgraded account can still be inside its promotion, paid is the stronger fact
+        if self.upgraded:
+            return '✅Paid'
         days_left = self.days_left
         if self.promotion_status == 'ACTIVE':
             if days_left is None:
@@ -1334,8 +1342,6 @@ class Subscription:
             if days_left <= 7:
                 return f'⚠️Trial {days_left}d left'
             return f'✅Trial {days_left}d left'
-        if self.upgraded:
-            return '✅Paid'
         if self.is_free_tier:
             return '♻️Always Free'
         return '✅Active'
@@ -1372,9 +1378,20 @@ class AccountSubscription:
 
     @property
     def primary(self) -> Subscription | None:
-        """The subscription the account actually runs on, the tenancy has exactly one in practice"""
+        """The subscription that describes the account tier
+
+        A tenancy usually returns several: an IDCS one that never carries a promotion, plus the
+        CLOUDCM one that does. Only the latter says anything about free tier versus paid, and the
+        order they come back in is not stable, so the promotion has to be what picks the winner.
+        """
         if len(self.subscriptions) == 0:
             return None
+        with_promotion = [s for s in self.subscriptions if s.is_free_tier]
+        if len(with_promotion) > 0:
+            return with_promotion[0]
+        billing = [s for s in self.subscriptions if s.service_name != 'IDCS']
+        if len(billing) > 0:
+            return billing[0]
         return self.subscriptions[0]
 
     @property
@@ -1397,7 +1414,8 @@ class AccountSubscription:
     @property
     def tag(self):
         primary = self.primary
-        return 'UNKNOWN' if primary is None else primary.tag
+        # no subscription came back at all, which is a policy problem rather than a tier
+        return 'NOSUB' if primary is None else primary.tag
 
     def __str__(self):
         return '{"state": "%s", "home_region": "%s", "regions": %d}' % (
@@ -2442,12 +2460,14 @@ class OCIClient:
         except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
-    # the always free allowances worth watching, all of them are availability domain scoped
+    # the always free allowances worth watching, all of them are availability domain scoped.
+    # the limit names are the ones the API actually accepts: standard-e2-1-core-count and
+    # standard-e2-1-memory-count do not exist and answer 400 InvalidParameter.
     __free_tier_limits__ = [
         ('compute', 'standard-a1-core-count', 'Ampere A1 cores'),
         ('compute', 'standard-a1-memory-count', 'Ampere A1 memory (GB)'),
-        ('compute', 'standard-e2-1-core-count', 'E2.1.Micro cores'),
-        ('compute', 'standard-e2-1-memory-count', 'E2.1.Micro memory (GB)'),
+        ('compute', 'standard-e2-micro-core-count', 'E2.1.Micro cores'),
+        ('compute', 'vm-standard-e2-1-micro-count', 'E2.1.Micro instances'),
         ('block-storage', 'total-storage-gb', 'Block storage (GB)'),
     ]
 
@@ -2479,10 +2499,12 @@ class OCIClient:
         services = list(dict.fromkeys([service_name for service_name, _, _ in self.__free_tier_limits__]))
         for service_name in services:
             try:
-                values = self.limits_client.list_limit_values(compartment_id=self.compartment_id,
-                                                              service_name=service_name,
-                                                              availability_domain=availability_domain,
-                                                              scope_type="AD").data
+                # compute alone reports 263 limits, so this has to page or the quota is missed
+                values = list_call_get_all_results(self.limits_client.list_limit_values,
+                                                   compartment_id=self.compartment_id,
+                                                   service_name=service_name,
+                                                   availability_domain=availability_domain,
+                                                   scope_type="AD").data
             except ServiceError as e:
                 self.warning(f"fail to list limit values of service {service_name}, details: {e.message}")
                 continue
@@ -6014,24 +6036,22 @@ class TelegramCommandBot:
         tags = await self.subscription_tags(oci_profiles)
 
         profiles = []
-        flagged_city_adjust = max([len(self.city(oci_profile)) for oci_profile in oci_profiles]) + 2
+        city_adjust = max([len(self.city(oci_profile)) for oci_profile in oci_profiles]) + 2
         tenancy_adjust = max([len(oci_profile) for oci_profile in oci_profiles]) + 2
+        tag_adjust = max([len(tag) for tag in tags.values()]) + 2 if len(tags) > 0 else 0
         for oci_profile in oci_profiles:
-            country_flag = self.flag(oci_profile)
-            city_text = f'{self.city(oci_profile)}'
-            # pad before escaping, the escapes are invisible but would eat the padding
-            tenancy_text = f'{escape_markdown_v2(oci_profile.rjust(tenancy_adjust))}'
-            spaces = " " * (flagged_city_adjust - len(city_text))
+            city_text = f'{self.flag(oci_profile)}{self.city(oci_profile).ljust(city_adjust)}'
             tag = tags.get(oci_profile)
-            tag_text = "" if tag is None else f'({tag})'
-            profiles.append(f'''{country_flag}`{city_text}``{spaces}`: '''
-                            f'''`{tenancy_text}{tag_text}`''')
+            tag_text = "" if tag is None else f'({tag})'.ljust(tag_adjust)
+            # the whole row lives inside a code block, so nothing needs escaping and the
+            # padding is exactly what the client shows
+            profiles.append(f'{city_text}: {oci_profile.rjust(tenancy_adjust)}{tag_text}'.rstrip())
         sorted_profiles = sorted(profiles)
 
         for i in range(0, len(oci_profiles), 24):
+            page = sorted_profiles[i:i + 24 if i + 24 < len(oci_profiles) else len(oci_profiles)]
             message = f"*profile list*:\n" if i == 0 else ""
-            message += "\n".join(
-                sorted_profiles[i:i + 24 if i + 24 < len(oci_profiles) else len(oci_profiles)]) + "\n"
+            message += "```bash\n" + "\n".join(page) + "\n```"
             await update.message.reply_markdown_v2(text=message,
                                                    reply_to_message_id=update.message.message_id)
 
@@ -6542,7 +6562,7 @@ class TelegramCommandBot:
         tags = {}
         for profile_name, subscription in subscriptions.items():
             if isinstance(subscription, Status):
-                tags[profile_name] = 'DEAD' if subscription.code == 'ProfileDead' else 'UNKNOWN'
+                tags[profile_name] = 'DEAD' if subscription.code == 'ProfileDead' else 'ERROR'
                 continue
             tags[profile_name] = subscription.tag
         return tags
@@ -6615,9 +6635,13 @@ class TelegramCommandBot:
                     message += f"  •  service: {primary.service_name}\n"
                     message += f"  •  tier: {primary.tier}\n"
                     message += f"  •  lifecycle: {primary.lifecycle_state}\n"
+                    message += f"  •  entity version: {primary.entity_version}\n"
                     if primary.subscription_number is not None:
                         message += f"  •  number: {primary.subscription_number}\n"
-                    if primary.promotion is not None:
+                    if primary.promotion is None:
+                        # V2 cloud subscriptions carry no promotion, so the tier cannot be derived
+                        message += f"  •  promotion: none reported\n"
+                    else:
                         message += f"  •  promotion: {primary.promotion_status}\n"
                     message += f"  •  started: {readable_date(primary.start_date)}\n"
                     if primary.expires_at is not None:
