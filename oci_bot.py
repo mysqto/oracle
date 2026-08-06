@@ -1150,6 +1150,155 @@ class ResourceLimit:
             self.name, readable_number(self.quota), readable_number(self.used), readable_number(self.available))
 
 
+# Oracle Always Free allowances, see
+# https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm
+#   micro:   up to two VM.Standard.E2.1.Micro instances (AMD processor)
+#   ampere:  the first 1500 OCPU hours and 9000 GB hours a month on VM.Standard.A1.Flex
+#            (Arm processor), which is 2 OCPUs and 12 GB of memory running continuously
+#   storage: 200 GB of block storage in total
+always_free_micro_instances = 2
+always_free_a1_ocpus = 2.0
+always_free_a1_memory_in_gbs = 12.0
+always_free_storage_in_gbs = 200.0
+# the Always Free Ampere ratio, 12 GB across 2 OCPUs
+always_free_a1_memory_per_ocpu = always_free_a1_memory_in_gbs / always_free_a1_ocpus
+
+
+class FreeTierUsage:
+    """What a tenancy actually runs, measured against the Always Free allowances"""
+    __instances__ = []
+    __boot_volumes__ = []
+    __volumes__ = []
+
+    def __init__(self, instances=None, boot_volumes=None, volumes=None):
+        self.instances = instances if instances is not None else []
+        self.boot_volumes = boot_volumes if boot_volumes is not None else []
+        self.volumes = volumes if volumes is not None else []
+
+    @property
+    def instances(self):
+        return self.__instances__
+
+    @instances.setter
+    def instances(self, instances):
+        self.__instances__ = instances
+
+    @property
+    def boot_volumes(self):
+        return self.__boot_volumes__
+
+    @boot_volumes.setter
+    def boot_volumes(self, boot_volumes):
+        self.__boot_volumes__ = boot_volumes
+
+    @property
+    def volumes(self):
+        return self.__volumes__
+
+    @volumes.setter
+    def volumes(self, volumes):
+        self.__volumes__ = volumes
+
+    @staticmethod
+    def alive(resource) -> bool:
+        """A terminated resource no longer holds any allocation"""
+        return getattr(resource, 'lifecycle_state', None) not in ['TERMINATED', 'TERMINATING']
+
+    @staticmethod
+    def ocpus(instance) -> float:
+        shape_config = getattr(instance, 'shape_config', None)
+        return float(getattr(shape_config, 'ocpus', 0) or 0)
+
+    @staticmethod
+    def memory(instance) -> float:
+        shape_config = getattr(instance, 'shape_config', None)
+        return float(getattr(shape_config, 'memory_in_gbs', 0) or 0)
+
+    @property
+    def a1_instances(self) -> list:
+        return [instance for instance in self.instances if self.alive(instance)
+                and str(getattr(instance, 'shape', '')).startswith('VM.Standard.A1')]
+
+    @property
+    def micro_instances(self) -> list:
+        return [instance for instance in self.instances if self.alive(instance)
+                and str(getattr(instance, 'shape', '')) == 'VM.Standard.E2.1.Micro']
+
+    @property
+    def a1_ocpus(self) -> float:
+        return sum([self.ocpus(instance) for instance in self.a1_instances])
+
+    @property
+    def a1_memory_in_gbs(self) -> float:
+        return sum([self.memory(instance) for instance in self.a1_instances])
+
+    @property
+    def storage_in_gbs(self) -> float:
+        stored = list(self.boot_volumes) + list(self.volumes)
+        return sum([float(getattr(volume, 'size_in_gbs', 0) or 0)
+                    for volume in stored if self.alive(volume)])
+
+    @property
+    def a1_over(self) -> bool:
+        return (self.a1_ocpus > always_free_a1_ocpus or
+                self.a1_memory_in_gbs > always_free_a1_memory_in_gbs)
+
+    @property
+    def micro_over(self) -> bool:
+        return len(self.micro_instances) > always_free_micro_instances
+
+    @property
+    def storage_over(self) -> bool:
+        return self.storage_in_gbs > always_free_storage_in_gbs
+
+    @property
+    def over_free_tier(self) -> bool:
+        return self.a1_over or self.micro_over or self.storage_over
+
+    @property
+    def excess_a1_instances(self) -> list:
+        """The A1 instances that do not fit once the biggest ones have filled the allowance"""
+        ocpus_left = always_free_a1_ocpus
+        memory_left = always_free_a1_memory_in_gbs
+        excess = []
+        for instance in sorted(self.a1_instances,
+                               key=lambda i: (self.ocpus(i), self.memory(i)), reverse=True):
+            if self.ocpus(instance) <= ocpus_left and self.memory(instance) <= memory_left:
+                ocpus_left -= self.ocpus(instance)
+                memory_left -= self.memory(instance)
+            else:
+                excess.append(instance)
+        return excess
+
+    @property
+    def excess_micro_instances(self) -> list:
+        """The newest micro instances beyond the two free ones"""
+        extra = len(self.micro_instances) - always_free_micro_instances
+        if extra <= 0:
+            return []
+        instances = list(self.micro_instances)
+        if all([getattr(instance, 'time_created', None) is not None for instance in instances]):
+            instances = sorted(instances, key=lambda i: i.time_created, reverse=True)
+        return instances[:extra]
+
+    @property
+    def even_a1_split(self):
+        """A shape config that keeps every A1 instance inside the allowance, None if impossible"""
+        count = len(self.a1_instances)
+        if count == 0:
+            return None
+        ocpus = int(always_free_a1_ocpus // count)
+        memory = int(always_free_a1_memory_in_gbs // count)
+        if ocpus < 1 or memory < 1:
+            return None
+        return ocpus, memory
+
+    def __str__(self):
+        return '{"a1": "%s OCPU / %s GB", "micro": %d, "storage": "%s GB", "over": %s}' % (
+            readable_number(self.a1_ocpus), readable_number(self.a1_memory_in_gbs),
+            len(self.micro_instances), readable_number(self.storage_in_gbs), self.over_free_tier)
+
+
 class Subscription:
     """Normalized view of a single account subscription
 
@@ -2531,20 +2680,36 @@ class OCIClient:
         self.reset_auth_failures()
         return limits
 
-    def get_availability(self, shape):
+    def get_availability(self, shape) -> InstanceLimit | Status:
         cpu_limit_name = 'standard-a1-core-count'
         memory_limit_name = 'standard-a1-memory-count'
         boot_volume_limit_name = 'total-storage-gb'
 
         if shape == 'VM.Standard.E2.1.Micro':
-            cpu_limit_name = 'standard-e2-1-core-count'
-            memory_limit_name = 'standard-e2-1-memory-count'
+            # standard-e2-1-core-count and standard-e2-1-memory-count do not exist, both answer
+            # 400 InvalidParameter. The E2 family reports no memory limit at all, and the micro
+            # shape is fixed at 1 OCPU with 1 GB, so its memory follows the core count.
+            cpu_limit_name = 'standard-e2-micro-core-count'
+            memory_limit_name = None
 
-        return InstanceLimit(cpu_cores=self.get_resource_availability(limit_name=cpu_limit_name).available,
-                             memory_in_gbs=self.get_resource_availability(limit_name=memory_limit_name).available,
-                             boot_volume_size_in_gbs=self.get_resource_availability(service_name='block-storage',
-                                                                                    limit_name=boot_volume_limit_name).
-                             available)
+        cpu_cores = self.get_resource_availability(limit_name=cpu_limit_name)
+        if isinstance(cpu_cores, Status):
+            return cpu_cores
+
+        memory_in_gbs = cpu_cores.available
+        if memory_limit_name is not None:
+            memory = self.get_resource_availability(limit_name=memory_limit_name)
+            if isinstance(memory, Status):
+                return memory
+            memory_in_gbs = memory.available
+
+        boot_volume = self.get_resource_availability(service_name='block-storage',
+                                                     limit_name=boot_volume_limit_name)
+        if isinstance(boot_volume, Status):
+            return boot_volume
+
+        return InstanceLimit(cpu_cores=cpu_cores.available, memory_in_gbs=memory_in_gbs,
+                             boot_volume_size_in_gbs=boot_volume.available)
 
     def save_ssh_key(self, create_instance_details) -> str | None:
         if create_instance_details.ssh_private_key() is not None:
@@ -5446,6 +5611,7 @@ class TelegramCommandBot:
         self.telegram_bot.add_handler(CommandHandler("profiles", self.list_profiles_handler))
         self.telegram_bot.add_handler(CommandHandler("profile", self.profile_details_handler))
         self.telegram_bot.add_handler(CommandHandler("profile_details", self.profile_details_handler))
+        self.telegram_bot.add_handler(CommandHandler("limit_check", self.limit_check_handler))
         self.telegram_bot.add_handler(CommandHandler("delete_profiles", self.delete_profiles_handler))
         self.telegram_bot.add_handler(CommandHandler("mark_dead", self.mark_dead_handler))
         self.telegram_bot.add_handler(CommandHandler("volumes", self.list_volumes_handler))
@@ -5753,6 +5919,33 @@ class TelegramCommandBot:
             limits = await asyncio.to_thread(oci_client.get_free_tier_limits)
             self._set_cache(cache_key, limits)
             return profile_name, limits
+
+    async def free_tier_usage(self, profile_name):
+        """What the profile runs today, measured against the Always Free allowances"""
+        oci_client = self.oci_clients.get(profile_name)
+        if oci_client is None:
+            return profile_name, Status(http.client.BAD_REQUEST,
+                                        "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        if oci_client.is_dead:
+            return profile_name, Status(http.client.UNAUTHORIZED, "ProfileDead",
+                                        f"Profile marked as dead after {oci_client.auth_failure_count} auth failures")
+
+        _, instances = await self.list_instances(profile_name)
+        if isinstance(instances, Status):
+            return profile_name, instances
+
+        # storage is a nice to have, an instance list on its own already answers the compute part
+        _, boot_volumes = await self.list_boot_volumes(profile_name)
+        _, volumes = await self.list_volumes(profile_name)
+        if isinstance(boot_volumes, Status):
+            logger.warning(f"fail to list boot volumes of {profile_name}, details: {boot_volumes}")
+        if isinstance(volumes, Status):
+            logger.warning(f"fail to list volumes of {profile_name}, details: {volumes}")
+
+        return profile_name, FreeTierUsage(
+            instances=instances,
+            boot_volumes=[] if isinstance(boot_volumes, Status) else boot_volumes,
+            volumes=[] if isinstance(volumes, Status) else volumes)
 
     async def subscription_state(self, profile_name):
         """Short subscription state for the alive check, empty when the account tells us nothing"""
@@ -6555,6 +6748,143 @@ class TelegramCommandBot:
             message += f"```"
             await update.message.reply_markdown_v2(text=message,
                                                    reply_to_message_id=update.message.message_id)
+
+    @staticmethod
+    def instance_line(usage: FreeTierUsage, instance, marker="") -> str:
+        return (f"     {marker}{instance.display_name}  "
+                f"{readable_number(usage.ocpus(instance))} OCPU / "
+                f"{readable_number(usage.memory(instance))} GB  {instance.lifecycle_state}\n")
+
+    def a1_report(self, oci_profile, usage: FreeTierUsage) -> str:
+        message = (f"  ⚠️ Ampere A1: {readable_number(usage.a1_ocpus)} OCPU / "
+                   f"{readable_number(usage.a1_memory_in_gbs)} GB used, free "
+                   f"{readable_number(always_free_a1_ocpus)} OCPU / "
+                   f"{readable_number(always_free_a1_memory_in_gbs)} GB, over by "
+                   f"{readable_number(max(0.0, usage.a1_ocpus - always_free_a1_ocpus))} OCPU / "
+                   f"{readable_number(max(0.0, usage.a1_memory_in_gbs - always_free_a1_memory_in_gbs))} GB\n")
+
+        excess = usage.excess_a1_instances
+        for instance in usage.a1_instances:
+            message += self.instance_line(usage, instance, "✗ " if instance in excess else "✓ ")
+
+        # resizing keeps every instance, so offer it before anything destructive
+        split = usage.even_a1_split
+        resizable = []
+        if split is not None:
+            ocpus, memory = split
+            resizable = [instance for instance in usage.a1_instances
+                         if usage.ocpus(instance) > ocpus or usage.memory(instance) > memory]
+
+        if len(resizable) > 0:
+            message += f"     suggested, resize to {split[0]}C{split[1]}G and keep them all:\n"
+            for instance in resizable:
+                message += (f"       /resize_instance {oci_profile} "
+                            f"{instance.display_name} {split[0]}C{split[1]}G\n")
+            message += f"     or drop the ones that do not fit:\n"
+        else:
+            message += f"     suggested, too many instances to resize, drop some:\n"
+
+        for instance in excess:
+            message += f"       /delete_instance {oci_profile} {instance.display_name}\n"
+        return message
+
+    def micro_report(self, oci_profile, usage: FreeTierUsage) -> str:
+        message = (f"  ⚠️ E2.1.Micro: {len(usage.micro_instances)} instances, "
+                   f"free {always_free_micro_instances}\n")
+        excess = usage.excess_micro_instances
+        for instance in usage.micro_instances:
+            message += self.instance_line(usage, instance, "✗ " if instance in excess else "✓ ")
+        # the micro shape is fixed at 1 OCPU / 1 GB, so resizing cannot help here
+        message += f"     suggested (the micro shape is fixed, it cannot be resized):\n"
+        for instance in excess:
+            message += f"       /delete_instance {oci_profile} {instance.display_name}\n"
+        return message
+
+    @staticmethod
+    def storage_report(usage: FreeTierUsage) -> str:
+        message = (f"  ⚠️ Storage: {readable_number(usage.storage_in_gbs)} GB used, "
+                   f"free {readable_number(always_free_storage_in_gbs)} GB, over by "
+                   f"{readable_number(usage.storage_in_gbs - always_free_storage_in_gbs)} GB\n")
+        stored = [volume for volume in list(usage.boot_volumes) + list(usage.volumes)
+                  if usage.alive(volume)]
+        for volume in sorted(stored, key=lambda v: float(getattr(v, 'size_in_gbs', 0) or 0),
+                             reverse=True)[:5]:
+            kind = "boot" if volume in usage.boot_volumes else "block"
+            message += (f"     {volume.display_name}  "
+                        f"{readable_number(getattr(volume, 'size_in_gbs', 0))} GB  {kind}\n")
+        # OCI boot volumes only ever grow, so shrinking one is not an option
+        message += (f"     suggested: delete an unused volume or an instance, "
+                    f"boot volumes cannot shrink\n")
+        return message
+
+    async def limit_check_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        oci_profiles, not_found = self.resolve_profiles(context.args)
+
+        if len(not_found) > 0:
+            await update.message.reply_markdown_v2(
+                text=f"profile not found: {markdown_list(not_found)}",
+                reply_to_message_id=update.message.message_id)
+        if len(oci_profiles) == 0:
+            return
+
+        tags = await self.subscription_tags(oci_profiles)
+        results = await asyncio.gather(*[self.free_tier_usage(oci_profile)
+                                         for oci_profile in oci_profiles], return_exceptions=True)
+
+        over, failed, within = [], [], 0
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning(f"fail to check limits, details: {result}")
+                continue
+            oci_profile, usage = result
+            if isinstance(usage, Status):
+                failed.append((oci_profile, usage))
+            elif usage.over_free_tier:
+                over.append((oci_profile, usage))
+            else:
+                within += 1
+
+        header = (f"*Limit Check*: {len(over)} of {len(oci_profiles)} profiles over the "
+                  f"Always Free allowance\n")
+        if len(over) == 0:
+            message = header
+            if len(failed) > 0:
+                message += f"```bash\n"
+                for oci_profile, status in failed:
+                    message += f"  ❓ {oci_profile}: {status.code}\n"
+                message += f"```"
+            await update.message.reply_markdown_v2(text=message,
+                                                   reply_to_message_id=update.message.message_id)
+            return
+
+        over = sorted(over, key=lambda x: f'{self.flagged_city(x[0])}{x[0]}')
+        # three per message, each report runs long
+        for i in range(0, len(over), 3):
+            message = header if i == 0 else ""
+            for oci_profile, usage in over[i:i + 3]:
+                tag = tags.get(oci_profile, 'UNKNOWN')
+                message += f"*`{self.flagged_city(oci_profile)} \\- {escape_markdown_v2(oci_profile)}`*\n"
+                message += f"```bash\n"
+                # an always free account risks the resources, a paid one just pays for them
+                message += (f"  tier: {tag}"
+                            f"{' (usage above Always Free is billable)' if tag == 'PAYGO' else ''}\n")
+                if usage.a1_over:
+                    message += self.a1_report(oci_profile, usage)
+                if usage.micro_over:
+                    message += self.micro_report(oci_profile, usage)
+                if usage.storage_over:
+                    message += self.storage_report(usage)
+                message += f"```\n"
+
+            if i == 0 and (within > 0 or len(failed) > 0):
+                message += f"{within} within limits"
+                message += f", {len(failed)} unreachable" if len(failed) > 0 else ""
+
+            if i == 0:
+                await update.message.reply_markdown_v2(
+                    text=message, reply_to_message_id=update.message.message_id)
+            else:
+                await update.message.reply_markdown_v2(text=message)
 
     async def subscription_tags(self, profiles) -> dict:
         """Compact subscription tier tag of every given profile, keyed by profile name"""
@@ -8271,6 +8601,7 @@ class TelegramCommandBot:
                           f"/tenancy [profiles]                    \\- show tenancy info\n"
                           f"/subscription [profiles]               \\- subscription state\n"
                           f"/subscriptions [profiles]              \\- alias subscription\n"
+                          f"/limit\\_check [profiles]                \\- free tier overage\n"
                           f"\n"
                           # Instance Management
                           f"# Instance Management\n"
