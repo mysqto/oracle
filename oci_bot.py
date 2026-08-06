@@ -215,6 +215,14 @@ def readable_date(value) -> str:
     return str(value)
 
 
+def readable_number(value) -> str:
+    if value is None:
+        return "?"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 async def ping(host, ipv6=False, count=8, markdown=True) -> str:
     ipv6 = validate_ipv6_address(host) or ipv6
     # check macOS or Linux
@@ -1047,6 +1055,96 @@ class InstanceLimit:
             self.cpu_cores, self.memory_in_gbs, self.boot_volume_size_in_gbs)
 
 
+class ResourceLimit:
+    """A service limit of the account together with how much of it is already used"""
+    __name__ = None
+    __label__ = None
+    __service_name__ = None
+    __quota__ = None
+    __used__ = None
+    __available__ = None
+
+    def __init__(self, name, label, service_name, quota=None, used=None, available=None):
+        self.name = name
+        self.label = label
+        self.service_name = service_name
+        self.quota = quota
+        self.used = used
+        self.available = available
+
+    @property
+    def name(self):
+        return self.__name__
+
+    @name.setter
+    def name(self, name):
+        self.__name__ = name
+
+    @property
+    def label(self):
+        return self.__label__
+
+    @label.setter
+    def label(self, label):
+        self.__label__ = label
+
+    @property
+    def service_name(self):
+        return self.__service_name__
+
+    @service_name.setter
+    def service_name(self, service_name):
+        self.__service_name__ = service_name
+
+    @property
+    def quota(self):
+        return self.__quota__
+
+    @quota.setter
+    def quota(self, quota):
+        self.__quota__ = quota
+
+    @property
+    def used(self):
+        return self.__used__
+
+    @used.setter
+    def used(self, used):
+        self.__used__ = used
+
+    @property
+    def available(self):
+        return self.__available__
+
+    @available.setter
+    def available(self, available):
+        self.__available__ = available
+
+    @property
+    def total(self):
+        """The limit itself, derived from used plus available when no quota is reported"""
+        if self.quota is not None:
+            return self.quota
+        if self.used is None or self.available is None:
+            return None
+        return self.used + self.available
+
+    @property
+    def exhausted(self):
+        return self.available is not None and self.available <= 0
+
+    def pretty(self) -> str:
+        total = self.total
+        if total is None:
+            return f'{readable_number(self.used)} used'
+        return (f'{readable_number(self.used)}/{readable_number(total)} used, '
+                f'{readable_number(self.available)} free')
+
+    def __str__(self):
+        return '{"name": "%s", "quota": %s, "used": %s, "available": %s}' % (
+            self.name, readable_number(self.quota), readable_number(self.used), readable_number(self.available))
+
+
 class Subscription:
     """Normalized view of a single account subscription
 
@@ -1214,6 +1312,17 @@ class Subscription:
         return 'UNKNOWN'
 
     @property
+    def tag(self):
+        """Compact tier tag, used by the profile list"""
+        if not self.active:
+            return 'INACTIVE'
+        if self.upgraded:
+            return 'PAYGO'
+        if self.is_free_tier:
+            return 'FREE'
+        return 'UNKNOWN'
+
+    @property
     def state(self):
         """Short human readable state, used by /alive and /tenancy"""
         if not self.active:
@@ -1284,6 +1393,11 @@ class AccountSubscription:
         primary = self.primary
         # no subscription visible: the tenancy has no access to the subscription API
         return '❓Unknown' if primary is None else primary.state
+
+    @property
+    def tag(self):
+        primary = self.primary
+        return 'UNKNOWN' if primary is None else primary.tag
 
     def __str__(self):
         return '{"state": "%s", "home_region": "%s", "regions": %d}' % (
@@ -2327,6 +2441,73 @@ class OCIClient:
                                                                 availability_domain=availability_domain).data
         except ServiceError as e:
             return Status(e.status, e.code, e.message)
+
+    # the always free allowances worth watching, all of them are availability domain scoped
+    __free_tier_limits__ = [
+        ('compute', 'standard-a1-core-count', 'Ampere A1 cores'),
+        ('compute', 'standard-a1-memory-count', 'Ampere A1 memory (GB)'),
+        ('compute', 'standard-e2-1-core-count', 'E2.1.Micro cores'),
+        ('compute', 'standard-e2-1-memory-count', 'E2.1.Micro memory (GB)'),
+        ('block-storage', 'total-storage-gb', 'Block storage (GB)'),
+    ]
+
+    def get_free_tier_limits(self) -> list[ResourceLimit] | Status:
+        """The always free allowances of the account, with the used and the available part of each
+
+        A limit the account has no access to is skipped rather than failing the whole lookup.
+        """
+        if self.is_dead:
+            return Status(http.client.UNAUTHORIZED, "ProfileDead",
+                          f"Profile marked as dead after {self.auth_failure_count} auth failures")
+
+        try:
+            availability_domain = self.default_availability_domain()
+        except ServiceError as e:
+            result = Status(e.status, e.code, e.message)
+            self.handle_api_result(result)
+            return result
+        except Exception as e:
+            return Status(http.client.INTERNAL_SERVER_ERROR, "LimitsClientError", str(e))
+
+        if availability_domain is None:
+            return Status(http.client.NOT_FOUND, "NoAvailabilityDomain",
+                          "no availability domain found for the tenancy")
+        availability_domain = availability_domain.name
+
+        # one call per service gives every quota of that service
+        quotas = {}
+        services = list(dict.fromkeys([service_name for service_name, _, _ in self.__free_tier_limits__]))
+        for service_name in services:
+            try:
+                values = self.limits_client.list_limit_values(compartment_id=self.compartment_id,
+                                                              service_name=service_name,
+                                                              availability_domain=availability_domain,
+                                                              scope_type="AD").data
+            except ServiceError as e:
+                self.warning(f"fail to list limit values of service {service_name}, details: {e.message}")
+                continue
+            for value in values:
+                quotas[(service_name, value.name)] = value.value
+
+        limits = []
+        for service_name, limit_name, label in self.__free_tier_limits__:
+            try:
+                availability = self.limits_client.get_resource_availability(
+                    service_name=service_name, limit_name=limit_name,
+                    compartment_id=self.compartment_id,
+                    availability_domain=availability_domain).data
+            except ServiceError as e:
+                self.warning(f"fail to get availability of limit {limit_name}, details: {e.message}")
+                continue
+            limits.append(ResourceLimit(name=limit_name, label=label, service_name=service_name,
+                                        quota=quotas.get((service_name, limit_name)),
+                                        used=availability.used, available=availability.available))
+
+        if len(limits) == 0:
+            return Status(http.client.NOT_FOUND, "NoLimitFound",
+                          "no service limit readable, check the tenancy policies")
+        self.reset_auth_failures()
+        return limits
 
     def get_availability(self, shape):
         cpu_limit_name = 'standard-a1-core-count'
@@ -4857,6 +5038,7 @@ class TelegramCommandBot:
         self._clear_cache(f"boot_volumes_{profile_name}")
         self._clear_cache(f"live_check_{profile_name}")
         self._clear_cache(f"subscription_{profile_name}")
+        self._clear_cache(f"limits_{profile_name}")
         logger.debug(f"Cleared cache for profile: {profile_name}")
     
     def load_dead_profiles(self):
@@ -5240,6 +5422,8 @@ class TelegramCommandBot:
         self.telegram_bot.add_handler(CommandHandler("subscriptions", self.subscription_handler))
         self.telegram_bot.add_handler(CommandHandler("instances", self.list_instances_handler))
         self.telegram_bot.add_handler(CommandHandler("profiles", self.list_profiles_handler))
+        self.telegram_bot.add_handler(CommandHandler("profile", self.profile_details_handler))
+        self.telegram_bot.add_handler(CommandHandler("profile_details", self.profile_details_handler))
         self.telegram_bot.add_handler(CommandHandler("delete_profiles", self.delete_profiles_handler))
         self.telegram_bot.add_handler(CommandHandler("mark_dead", self.mark_dead_handler))
         self.telegram_bot.add_handler(CommandHandler("volumes", self.list_volumes_handler))
@@ -5520,6 +5704,34 @@ class TelegramCommandBot:
             self._set_cache(cache_key, subscription)
             return profile_name, subscription
 
+    async def free_tier_limits(self, profile_name):
+        # Check if profile is dead
+        oci_client = self.oci_clients.get(profile_name)
+        if oci_client is None:
+            return profile_name, Status(http.client.BAD_REQUEST,
+                                        "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        if oci_client.is_dead:
+            return profile_name, Status(http.client.UNAUTHORIZED, "ProfileDead",
+                                        f"Profile marked as dead after {oci_client.auth_failure_count} auth failures")
+
+        cache_key = f"limits_{profile_name}"
+        cached = self._get_cached(cache_key, ttl=300)  # 5 min cache (limits move only when instances do)
+        if cached is not None:
+            return profile_name, cached
+
+        # Wait for profile to be ready if warmup is still in progress
+        if not self.is_profile_ready(profile_name):
+            logger.debug(f"Profile {profile_name} not ready yet, waiting...")
+            ready = await self.wait_for_profile_ready(profile_name, timeout=10.0)
+            if not ready:
+                logger.warning(f"Profile {profile_name} still not ready after timeout, proceeding anyway")
+
+        # Use semaphore to limit concurrent OCI API calls
+        async with self.semaphore:
+            limits = await asyncio.to_thread(oci_client.get_free_tier_limits)
+            self._set_cache(cache_key, limits)
+            return profile_name, limits
+
     async def subscription_state(self, profile_name):
         """Short subscription state for the alive check, empty when the account tells us nothing"""
         try:
@@ -5798,24 +6010,28 @@ class TelegramCommandBot:
                                                reply_to_message_id=update.message.message_id)
 
     async def list_profiles_handler(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-        oci_profiles = self.oci_clients.keys()
+        oci_profiles = list(self.oci_clients.keys())
+        tags = await self.subscription_tags(oci_profiles)
 
         profiles = []
-        message = ""
         flagged_city_adjust = max([len(self.city(oci_profile)) for oci_profile in oci_profiles]) + 2
         tenancy_adjust = max([len(oci_profile) for oci_profile in oci_profiles]) + 2
         for oci_profile in oci_profiles:
             country_flag = self.flag(oci_profile)
             city_text = f'{self.city(oci_profile)}'
-            tenancy_text = f'{escape_markdown_v2(oci_profile)}'
+            # pad before escaping, the escapes are invisible but would eat the padding
+            tenancy_text = f'{escape_markdown_v2(oci_profile.rjust(tenancy_adjust))}'
             spaces = " " * (flagged_city_adjust - len(city_text))
-            profiles.append(f'''{country_flag}`{city_text}``{spaces}`: `{tenancy_text.rjust(tenancy_adjust)}`''')
+            tag = tags.get(oci_profile)
+            tag_text = "" if tag is None else f'({tag})'
+            profiles.append(f'''{country_flag}`{city_text}``{spaces}`: '''
+                            f'''`{tenancy_text}{tag_text}`''')
         sorted_profiles = sorted(profiles)
 
         for i in range(0, len(oci_profiles), 24):
-            if i == 0:
-                message += f"*profile list*:\n"
-            message = "\n".join(sorted_profiles[i:i + 24 if i + 24 < len(oci_profiles) else len(oci_profiles)]) + "\n"
+            message = f"*profile list*:\n" if i == 0 else ""
+            message += "\n".join(
+                sorted_profiles[i:i + 24 if i + 24 < len(oci_profiles) else len(oci_profiles)]) + "\n"
             await update.message.reply_markdown_v2(text=message,
                                                    reply_to_message_id=update.message.message_id)
 
@@ -6225,6 +6441,111 @@ class TelegramCommandBot:
             profile_name, subscription = result
             subscriptions[profile_name] = subscription
         return subscriptions
+
+    async def profile_details_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        oci_profiles, not_found = self.resolve_profiles(context.args)
+
+        if len(not_found) > 0:
+            await update.message.reply_markdown_v2(
+                text=f"profile not found: {markdown_list(not_found)}",
+                reply_to_message_id=update.message.message_id)
+        if len(oci_profiles) == 0:
+            return
+
+        if len(context.args) == 0 and len(oci_profiles) > 1:
+            await update.message.reply_markdown_v2(
+                text=f"please name the profile, e\\.g\\. "
+                     f"`/profile {escape_markdown_v2(sorted(oci_profiles)[0])}`, "
+                     f"use `/profiles` to list them all",
+                reply_to_message_id=update.message.message_id)
+            return
+
+        for oci_profile in sorted(oci_profiles, key=lambda x: f'{self.flagged_city(x)}{x}'):
+            _, tenancy = await self.tenancy(oci_profile)
+            _, subscription = await self.subscription(oci_profile)
+            _, limits = await self.free_tier_limits(oci_profile)
+            _, instances = await self.list_instances(oci_profile)
+            oci_client = self.oci_client(oci_profile)
+
+            message = f"*`{self.flagged_city(oci_profile)} \\- {escape_markdown_v2(oci_profile)}`*\n"
+            message += f"```bash\n"
+
+            message += f"# Tenancy\n"
+            if isinstance(tenancy, Status):
+                message += f"  •  fail to get tenancy: {tenancy.code}\n"
+            else:
+                message += f"  •  name: {tenancy.name}\n"
+                message += f"  •  id: {tenancy.id}\n"
+                message += f"  •  home region: {tenancy.home_region_key}\n"
+            message += f"  •  region: {oci_client.oci_config.region}\n"
+
+            message += f"\n# Subscription\n"
+            if isinstance(subscription, Status):
+                message += f"  •  fail to get subscription: {subscription.code}\n"
+            else:
+                message += f"  •  state: {subscription.state}\n"
+                primary = subscription.primary
+                if primary is None:
+                    message += f"  •  account: no subscription visible, check the tenancy policies\n"
+                else:
+                    message += f"  •  service: {primary.service_name}\n"
+                    message += f"  •  tier: {primary.tier}\n"
+                    message += f"  •  lifecycle: {primary.lifecycle_state}\n"
+                    if primary.promotion is not None:
+                        message += f"  •  promotion: {primary.promotion_status}\n"
+                    message += f"  •  started: {readable_date(primary.start_date)}\n"
+                    if primary.expires_at is not None:
+                        days_left = primary.days_left
+                        if days_left is not None and days_left < 0:
+                            message += f"  •  promotion ended: {readable_date(primary.expires_at)}\n"
+                        else:
+                            message += (f"  •  expires: {readable_date(primary.expires_at)} "
+                                        f"({days_left}d left)\n")
+                home_region = subscription.home_region
+                message += f"  •  regions: {len(subscription.regions)} subscribed"
+                message += f" (home: {home_region})\n" if home_region is not None else "\n"
+
+            message += f"\n# Free Tier Limits\n"
+            if isinstance(limits, Status):
+                message += f"  •  fail to get limits: {limits.code}\n"
+            else:
+                label_adjust = max([len(limit.label) for limit in limits]) + 1
+                for limit in limits:
+                    marker = " 🈵" if limit.exhausted else ""
+                    message += f"  •  {limit.label.ljust(label_adjust)}: {limit.pretty()}{marker}\n"
+
+            message += f"\n# Instances\n"
+            if isinstance(instances, Status):
+                message += f"  •  fail to list instances: {instances.code}\n"
+            elif len(instances) == 0:
+                message += f"  •  none, use /create_instance to create one\n"
+            else:
+                states = {}
+                for instance in instances:
+                    states[instance.lifecycle_state] = states.get(instance.lifecycle_state, 0) + 1
+                message += f"  •  {len(instances)} total: "
+                message += ", ".join([f'{count} {state.lower()}' for state, count in sorted(states.items())]) + "\n"
+
+            running_tasks = self.profile_tasks(oci_profile)
+            if running_tasks is not None and len(running_tasks) > 0:
+                message += f"\n# Tasks\n"
+                for task in running_tasks:
+                    message += f"  •  {task.command}\n"
+
+            message += f"```"
+            await update.message.reply_markdown_v2(text=message,
+                                                   reply_to_message_id=update.message.message_id)
+
+    async def subscription_tags(self, profiles) -> dict:
+        """Compact subscription tier tag of every given profile, keyed by profile name"""
+        subscriptions = await self.subscriptions(profiles)
+        tags = {}
+        for profile_name, subscription in subscriptions.items():
+            if isinstance(subscription, Status):
+                tags[profile_name] = 'DEAD' if subscription.code == 'ProfileDead' else 'UNKNOWN'
+                continue
+            tags[profile_name] = subscription.tag
+        return tags
 
     def resolve_profiles(self, args) -> tuple[list[str], list[str]]:
         """Resolve command arguments into profile names, accepting country codes and city names"""
@@ -7917,6 +8238,8 @@ class TelegramCommandBot:
                           # Profile Management
                           f"# Profile Management\n"
                           f"/profiles                              \\- list profiles\n"
+                          f"/profile <profile>                     \\- profile details\n"
+                          f"/profile\\_details <profile>             \\- alias profile\n"
                           f"/add\\_profile                           \\- add new profile\n"
                           f"/cancel                                \\- cancel add\\_profile\n"
                           f"/delete\\_profiles <profiles>            \\- delete profiles\n"
