@@ -28,7 +28,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from configparser import ConfigParser
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import cytoolz
@@ -54,11 +54,14 @@ from oci.exceptions import InvalidPrivateKey, MissingPrivateKeyPassphrase, Servi
 from oci.identity import IdentityClient
 from oci.identity.models import Tenancy, Region, RegionSubscription
 from oci.limits import LimitsClient
-from oci.limits.models import LimitValueSummary, ServiceSummary
+from oci.limits.models import LimitValueSummary, ResourceAvailability, ServiceSummary
 from oci.object_storage import ObjectStorageClient
 from oci.object_storage.models import CreateBucketDetails, Bucket
 from oci.pagination import list_call_get_all_results
+from oci.retry import DEFAULT_RETRY_STRATEGY
 from oci.tenant_manager_control_plane import SubscriptionClient
+from oci.usage_api import UsageapiClient
+from oci.usage_api.models import RequestSummarizedUsagesDetails
 from oci.util import to_dict
 from telegram import Update, User
 from telegram.constants import ParseMode, ChatType
@@ -1160,8 +1163,131 @@ always_free_micro_instances = 2
 always_free_a1_ocpus = 2.0
 always_free_a1_memory_in_gbs = 12.0
 always_free_storage_in_gbs = 200.0
+# the metered side of the same allowances, what Oracle actually bills against each month
+always_free_a1_ocpu_hours = 1500.0
+always_free_a1_gb_hours = 9000.0
+
+# Usage API SKU part numbers. The part number is the stable identifier: sku_name is a display
+# string and the unit label differs between the A1 and the micro compute lines.
+usage_sku_a1_ocpu = 'B93297'        # Standard - A1
+usage_sku_a1_memory = 'B93298'      # Standard - A1 - Memory
+usage_sku_micro = 'B91444'          # Virtual Machine Standard - E2 Micro - Free
+usage_sku_block_volume = 'B91445'   # Block Volume - Free
 # the Always Free Ampere ratio, 12 GB across 2 OCPUs
 always_free_a1_memory_per_ocpu = always_free_a1_memory_in_gbs / always_free_a1_ocpus
+
+
+class AccountUsage:
+    """Metered consumption and cost of an account for a billing period
+
+    This is the Usage API view: what Oracle actually counted, as opposed to FreeTierUsage which
+    reads what is provisioned right now. An instance created mid month shows a part month here.
+    """
+    __items__ = []
+    __cost__ = 0.0
+    __currency__ = None
+    __started__ = None
+    __ended__ = None
+
+    def __init__(self, items=None, cost=0.0, currency=None, started=None, ended=None):
+        self.items = items if items is not None else []
+        self.cost = cost
+        self.currency = currency
+        self.started = started
+        self.ended = ended
+
+    @property
+    def items(self):
+        return self.__items__
+
+    @items.setter
+    def items(self, items):
+        self.__items__ = items
+
+    @property
+    def cost(self):
+        return self.__cost__
+
+    @cost.setter
+    def cost(self, cost):
+        self.__cost__ = cost
+
+    @property
+    def currency(self):
+        return self.__currency__
+
+    @currency.setter
+    def currency(self, currency):
+        self.__currency__ = currency
+
+    @property
+    def started(self):
+        return self.__started__
+
+    @started.setter
+    def started(self, started):
+        self.__started__ = started
+
+    @property
+    def ended(self):
+        return self.__ended__
+
+    @ended.setter
+    def ended(self, ended):
+        self.__ended__ = ended
+
+    def quantity(self, sku_part_number) -> float:
+        return sum([float(item.computed_quantity or 0) for item in self.items
+                    if item.sku_part_number == sku_part_number])
+
+    @property
+    def a1_ocpu_hours(self) -> float:
+        return self.quantity(usage_sku_a1_ocpu)
+
+    @property
+    def a1_gb_hours(self) -> float:
+        return self.quantity(usage_sku_a1_memory)
+
+    @property
+    def micro_ocpu_hours(self) -> float:
+        return self.quantity(usage_sku_micro)
+
+    @property
+    def storage_gb_months(self) -> float:
+        return self.quantity(usage_sku_block_volume)
+
+    @property
+    def a1_ocpu_percent(self) -> float:
+        return 100.0 * self.a1_ocpu_hours / always_free_a1_ocpu_hours
+
+    @property
+    def a1_gb_percent(self) -> float:
+        return 100.0 * self.a1_gb_hours / always_free_a1_gb_hours
+
+    @property
+    def over_grant(self) -> bool:
+        return (self.a1_ocpu_hours > always_free_a1_ocpu_hours or
+                self.a1_gb_hours > always_free_a1_gb_hours)
+
+    @property
+    def billed(self) -> bool:
+        return (self.cost or 0) > 0
+
+    @property
+    def money(self) -> str:
+        # a free tier tenancy reports no currency, sometimes as None and sometimes as blank
+        currency = (self.currency or "").strip()
+        if not currency:
+            return "no charge" if not self.billed else f"{self.cost:.2f}"
+        return f"{self.cost:.2f} {currency}"
+
+    @property
+    def period(self) -> str:
+        return f"{readable_date(self.started)} to {readable_date(self.ended)}"
+
+    def __str__(self):
+        return '{"a1_ocpu_hours": %.1f, "a1_gb_hours": %.1f, "cost": "%s", "over_grant": %s}' % (
+            self.a1_ocpu_hours, self.a1_gb_hours, self.money, self.over_grant)
 
 
 class FreeTierUsage:
@@ -2086,6 +2212,7 @@ class OCIClient:
     __object_storage_client__ = None
     __identity_client__ = None
     __subscription_client__ = None
+    __usage_client__ = None
     __client_name__ = None
     __telegram_bot__ = None
     __telegram_admin_chat_id__ = None
@@ -2584,30 +2711,42 @@ class OCIClient:
 
     def list_limits(self, service_name="compute", scope_type="AD") -> list[LimitValueSummary] | Status:
         try:
-            availability_domain = self.default_availability_domain().name
             if scope_type == "REGION":
-                availability_domain = None
-            return self.limits_client.list_limit_values(compartment_id=self.compartment_id,
-                                                        availability_domain=availability_domain,
-                                                        service_name=service_name, scope_type=scope_type).data
+                return list_call_get_all_results(self.limits_client.list_limit_values,
+                                                 compartment_id=self.compartment_id,
+                                                 availability_domain=None,
+                                                 service_name=service_name, scope_type=scope_type).data
+            # compute alone reports 263 limits per domain, so this has to page as well as walk
+            return self.across_availability_domains(
+                lambda availability_domain: list_call_get_all_results(
+                    self.limits_client.list_limit_values, compartment_id=self.compartment_id,
+                    availability_domain=availability_domain,
+                    service_name=service_name, scope_type=scope_type).data)
         except ServiceError as e:
             return Status(e.status, e.code, e.message)
 
     def get_resource_availability(self, limit_name, service_name="compute", scope_type="AD"):
-        limits = self.list_limits(service_name=service_name, scope_type=scope_type)
-        if isinstance(limits, Status):
-            return limits
-
-        # check cpu cores
+        """Usage of a limit, summed over every availability domain it is scoped to"""
         try:
-            availability_domain = self.default_availability_domain().name
             if scope_type == "REGION":
-                availability_domain = None
-            return self.limits_client.get_resource_availability(compartment_id=self.compartment_id,
-                                                                limit_name=limit_name, service_name=service_name,
-                                                                availability_domain=availability_domain).data
+                return self.limits_client.get_resource_availability(
+                    compartment_id=self.compartment_id, limit_name=limit_name,
+                    service_name=service_name, availability_domain=None).data
+
+            availabilities = self.across_availability_domains(
+                lambda availability_domain: [self.limits_client.get_resource_availability(
+                    compartment_id=self.compartment_id, limit_name=limit_name,
+                    service_name=service_name, availability_domain=availability_domain).data])
         except ServiceError as e:
             return Status(e.status, e.code, e.message)
+
+        if isinstance(availabilities, Status):
+            return availabilities
+
+        # an instance in the second domain counts just as much as one in the first
+        return ResourceAvailability(
+            used=sum([availability.used or 0 for availability in availabilities]),
+            available=sum([availability.available or 0 for availability in availabilities]))
 
     # the always free allowances worth watching, all of them are availability domain scoped.
     # the limit names are the ones the API actually accepts: standard-e2-1-core-count and
@@ -2629,46 +2768,25 @@ class OCIClient:
             return Status(http.client.UNAUTHORIZED, "ProfileDead",
                           f"Profile marked as dead after {self.auth_failure_count} auth failures")
 
-        try:
-            availability_domain = self.default_availability_domain()
-        except ServiceError as e:
-            result = Status(e.status, e.code, e.message)
-            self.handle_api_result(result)
-            return result
-        except Exception as e:
-            return Status(http.client.INTERNAL_SERVER_ERROR, "LimitsClientError", str(e))
-
-        if availability_domain is None:
-            return Status(http.client.NOT_FOUND, "NoAvailabilityDomain",
-                          "no availability domain found for the tenancy")
-        availability_domain = availability_domain.name
-
-        # one call per service gives every quota of that service
+        # one call per service and domain gives every quota of that service
         quotas = {}
         services = list(dict.fromkeys([service_name for service_name, _, _ in self.__free_tier_limits__]))
         for service_name in services:
-            try:
-                # compute alone reports 263 limits, so this has to page or the quota is missed
-                values = list_call_get_all_results(self.limits_client.list_limit_values,
-                                                   compartment_id=self.compartment_id,
-                                                   service_name=service_name,
-                                                   availability_domain=availability_domain,
-                                                   scope_type="AD").data
-            except ServiceError as e:
-                self.warning(f"fail to list limit values of service {service_name}, details: {e.message}")
+            values = self.list_limits(service_name=service_name, scope_type="AD")
+            if isinstance(values, Status):
+                self.warning(f"fail to list limit values of service {service_name}, details: {values}")
                 continue
             for value in values:
-                quotas[(service_name, value.name)] = value.value
+                # the same limit is reported once per domain, the account holds the sum of them
+                key = (service_name, value.name)
+                quotas[key] = quotas.get(key, 0) + (value.value or 0)
 
         limits = []
         for service_name, limit_name, label in self.__free_tier_limits__:
-            try:
-                availability = self.limits_client.get_resource_availability(
-                    service_name=service_name, limit_name=limit_name,
-                    compartment_id=self.compartment_id,
-                    availability_domain=availability_domain).data
-            except ServiceError as e:
-                self.warning(f"fail to get availability of limit {limit_name}, details: {e.message}")
+            availability = self.get_resource_availability(limit_name=limit_name,
+                                                          service_name=service_name)
+            if isinstance(availability, Status):
+                self.warning(f"fail to get availability of limit {limit_name}, details: {availability}")
                 continue
             limits.append(ResourceLimit(name=limit_name, label=label, service_name=service_name,
                                         quota=quotas.get((service_name, limit_name)),
@@ -3952,13 +4070,53 @@ class OCIClient:
             return Status(e.status, e.code, e.message)
 
     def list_availability_domains(self):
-        return self.identity_client.list_availability_domains(self.compartment_id).data
+        """The availability domains of the region, cached because they never change"""
+        cached = self._get_cached_method_result('availability_domains', self.compartment_id, ttl=3600)
+        if cached is not None:
+            return cached
+        domains = self.identity_client.list_availability_domains(self.compartment_id).data
+        self._set_cached_method_result('availability_domains', self.compartment_id, domains)
+        return domains
 
     def default_availability_domain(self):
         availability_domains = self.list_availability_domains()
         if len(availability_domains) == 0:
             return
         return availability_domains[0]
+
+    def availability_domain_count(self) -> int:
+        """How many domains the region has, the limits are reported and summed per domain"""
+        try:
+            return len(self.list_availability_domains())
+        except Exception as e:
+            self.warning(f"fail to count availability domains, details: {e}")
+            return 0
+
+    def across_availability_domains(self, call) -> list | Status:
+        """Run an availability domain scoped listing over every domain and merge the results
+
+        OCI scopes boot volumes, attachments, ephemeral IPs and service limits per availability
+        domain. Asking only the first one silently hides everything living in the others, which
+        reads as an empty account in a region like eu-frankfurt-1 that has three.
+        """
+        try:
+            domains = self.list_availability_domains()
+        except ServiceError as e:
+            result = Status(e.status, e.code, e.message)
+            self.handle_api_result(result)
+            return result
+
+        if len(domains) == 0:
+            return Status(http.client.NOT_FOUND, "NoAvailabilityDomain",
+                          "no availability domain found for the tenancy")
+
+        merged = []
+        for domain in domains:
+            try:
+                merged.extend(call(domain.name))
+            except ServiceError as e:
+                return Status(e.status, e.code, e.message)
+        return merged
 
     def get_tenancy(self) -> Tenancy | Status:
         # Skip dead profiles to avoid wasting time
@@ -4040,6 +4198,67 @@ class OCIClient:
             subscriptions.append(Subscription(detail))
         return subscriptions
 
+    @property
+    def usage_client(self):
+        """Lazy initialization of UsageapiClient, the usage API answers from the home region"""
+        if self.__usage_client__ is None:
+            config = dict(self.oci_config)
+            home_region = self.home_region()
+            if home_region is not None:
+                config['region'] = home_region
+            self.__usage_client__ = UsageapiClient(config=config)
+        return self.__usage_client__
+
+    @usage_client.setter
+    def usage_client(self, usage_client):
+        self.__usage_client__ = usage_client
+
+    @staticmethod
+    def usage_period() -> tuple:
+        """Month to date, the window Oracle resets the free grants over"""
+        now = datetime.now(timezone.utc)
+        started = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        ended = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if ended <= started:
+            # on the first of the month there is not a whole day yet
+            ended = started + timedelta(hours=1)
+        return started, ended
+
+    def summarize_usage(self, query_type, started, ended):
+        """One Usage API query grouped by SKU, the part number identifies each metered line"""
+        details = RequestSummarizedUsagesDetails(
+            tenant_id=self.compartment_id, granularity="MONTHLY", query_type=query_type,
+            time_usage_started=started, time_usage_ended=ended, group_by=["skuPartNumber"])
+        # this API rate limits readily, 429 has to back off rather than fail the command
+        return self.usage_client.request_summarized_usages(
+            details, retry_strategy=DEFAULT_RETRY_STRATEGY).data.items
+
+    def get_usage(self) -> AccountUsage | Status:
+        """Metered consumption and cost of the account so far this month"""
+        if self.is_dead:
+            return Status(http.client.UNAUTHORIZED, "ProfileDead",
+                          f"Profile marked as dead after {self.auth_failure_count} auth failures")
+
+        started, ended = self.usage_period()
+        try:
+            items = self.summarize_usage("USAGE", started, ended)
+        except ServiceError as e:
+            return Status(e.status, e.code, e.message)
+        except Exception as e:
+            return Status(http.client.INTERNAL_SERVER_ERROR, "UsageClientError", str(e))
+
+        # cost is a separate query, a failure there must not lose the metered numbers
+        cost, currency = 0.0, None
+        try:
+            for item in self.summarize_usage("COST", started, ended):
+                cost += float(item.computed_amount or 0)
+                currency = item.currency or currency
+        except ServiceError as e:
+            self.warning(f"fail to get cost, details: {e.message}")
+
+        return AccountUsage(items=items, cost=cost, currency=currency,
+                            started=started, ended=ended)
+
     def get_subscription(self) -> AccountSubscription | Status:
         """Subscription state of the account: the account subscriptions plus the subscribed regions"""
         regions = self.list_region_subscriptions()
@@ -4080,10 +4299,12 @@ class OCIClient:
 
     def list_public_ips(self) -> list[PublicIp] | Status:
         try:
-            availability_domain = self.default_availability_domain().name
-            ephemeral_ips = (self.network_client.list_public_ips(scope="AVAILABILITY_DOMAIN",
-                                                                 availability_domain=availability_domain,
-                                                                 compartment_id=self.compartment_id).data)
+            ephemeral_ips = self.across_availability_domains(
+                lambda availability_domain: self.network_client.list_public_ips(
+                    scope="AVAILABILITY_DOMAIN", availability_domain=availability_domain,
+                    compartment_id=self.compartment_id).data)
+            if isinstance(ephemeral_ips, Status):
+                return ephemeral_ips
 
             reserved_ips = self.network_client.list_public_ips(scope="REGION", compartment_id=self.compartment_id).data
             return ephemeral_ips + reserved_ips
@@ -4555,24 +4776,22 @@ class OCIClient:
     def list_boot_volume_attachments(self, instance_id=None,
                                      boot_volume_id=None) -> list[BootVolumeAttachment] | Status:
         try:
-            availability_domain = self.default_availability_domain().name
-            return self.oci_client.list_boot_volume_attachments(compartment_id=self.compartment_id,
-                                                                availability_domain=availability_domain,
-                                                                instance_id=instance_id,
-                                                                boot_volume_id=boot_volume_id).data
+            return self.across_availability_domains(
+                lambda availability_domain: self.oci_client.list_boot_volume_attachments(
+                    compartment_id=self.compartment_id, availability_domain=availability_domain,
+                    instance_id=instance_id, boot_volume_id=boot_volume_id).data)
         except ServiceError as ex:
             return Status(ex.status, ex.code, ex.message)
 
     def list_volume_attachments(self, instance_id=None,
                                 volume_id=None) -> list[VolumeAttachment] | Status:
         try:
-            availability_domain = self.default_availability_domain().name
-            return self.oci_client.list_volume_attachments(compartment_id=self.compartment_id,
-                                                           availability_domain=availability_domain,
-                                                           instance_id=instance_id,
-                                                           volume_id=volume_id).data
+            return self.across_availability_domains(
+                lambda availability_domain: self.oci_client.list_volume_attachments(
+                    compartment_id=self.compartment_id, availability_domain=availability_domain,
+                    instance_id=instance_id, volume_id=volume_id).data)
         except ServiceError as ex:
-            Status(ex.status, ex.code, ex.message)
+            return Status(ex.status, ex.code, ex.message)
 
     def get_volume_attachment(self, attachment_id) -> VolumeAttachment | Status:
         try:
@@ -4582,9 +4801,12 @@ class OCIClient:
 
     def list_boot_volumes(self, instance_id=None) -> list[BootVolume] | Status:
         try:
-            availability_domain = self.default_availability_domain().name
-            boot_volumes = self.block_storage_client.list_boot_volumes(compartment_id=self.compartment_id,
-                                                                       availability_domain=availability_domain).data
+            boot_volumes = self.across_availability_domains(
+                lambda availability_domain: self.block_storage_client.list_boot_volumes(
+                    compartment_id=self.compartment_id,
+                    availability_domain=availability_domain).data)
+            if isinstance(boot_volumes, Status):
+                return boot_volumes
 
             if instance_id is None:
                 return boot_volumes
@@ -5226,6 +5448,7 @@ class TelegramCommandBot:
         self._clear_cache(f"live_check_{profile_name}")
         self._clear_cache(f"subscription_{profile_name}")
         self._clear_cache(f"limits_{profile_name}")
+        self._clear_cache(f"usage_{profile_name}")
         logger.debug(f"Cleared cache for profile: {profile_name}")
     
     def load_dead_profiles(self):
@@ -5612,6 +5835,7 @@ class TelegramCommandBot:
         self.telegram_bot.add_handler(CommandHandler("profile", self.profile_details_handler))
         self.telegram_bot.add_handler(CommandHandler("profile_details", self.profile_details_handler))
         self.telegram_bot.add_handler(CommandHandler("limit_check", self.limit_check_handler))
+        self.telegram_bot.add_handler(CommandHandler("usage", self.usage_handler))
         self.telegram_bot.add_handler(CommandHandler("delete_profiles", self.delete_profiles_handler))
         self.telegram_bot.add_handler(CommandHandler("mark_dead", self.mark_dead_handler))
         self.telegram_bot.add_handler(CommandHandler("volumes", self.list_volumes_handler))
@@ -5946,6 +6170,33 @@ class TelegramCommandBot:
             instances=instances,
             boot_volumes=[] if isinstance(boot_volumes, Status) else boot_volumes,
             volumes=[] if isinstance(volumes, Status) else volumes)
+
+    async def account_usage(self, profile_name):
+        """Metered consumption and cost of the profile so far this month"""
+        oci_client = self.oci_clients.get(profile_name)
+        if oci_client is None:
+            return profile_name, Status(http.client.BAD_REQUEST,
+                                        "NoOCIProfile", f"OCI Profile not found: {profile_name}")
+        if oci_client.is_dead:
+            return profile_name, Status(http.client.UNAUTHORIZED, "ProfileDead",
+                                        f"Profile marked as dead after {oci_client.auth_failure_count} auth failures")
+
+        cache_key = f"usage_{profile_name}"
+        # metered figures move slowly and the usage API rate limits hard, so hold them an hour
+        cached = self._get_cached(cache_key, ttl=3600)
+        if cached is not None:
+            return profile_name, cached
+
+        if not self.is_profile_ready(profile_name):
+            logger.debug(f"Profile {profile_name} not ready yet, waiting...")
+            ready = await self.wait_for_profile_ready(profile_name, timeout=10.0)
+            if not ready:
+                logger.warning(f"Profile {profile_name} still not ready after timeout, proceeding anyway")
+
+        async with self.semaphore:
+            usage = await asyncio.to_thread(oci_client.get_usage)
+            self._set_cache(cache_key, usage)
+            return profile_name, usage
 
     async def subscription_state(self, profile_name):
         """Short subscription state for the alive check, empty when the account tells us nothing"""
@@ -6718,7 +6969,10 @@ class TelegramCommandBot:
                 message += f"  •  regions: {len(subscription.regions)} subscribed"
                 message += f" (home: {home_region})\n" if home_region is not None else "\n"
 
-            message += f"\n# Free Tier Limits\n"
+            domain_count = oci_client.availability_domain_count()
+            message += f"\n# Free Tier Limits"
+            # the limits are per domain, so say how many were summed
+            message += f" ({domain_count} availability domains)\n" if domain_count > 1 else "\n"
             if isinstance(limits, Status):
                 message += f"  •  fail to get limits: {limits.code}\n"
             else:
@@ -6879,6 +7133,89 @@ class TelegramCommandBot:
             if i == 0 and (within > 0 or len(failed) > 0):
                 message += f"{within} within limits"
                 message += f", {len(failed)} unreachable" if len(failed) > 0 else ""
+
+            if i == 0:
+                await update.message.reply_markdown_v2(
+                    text=message, reply_to_message_id=update.message.message_id)
+            else:
+                await update.message.reply_markdown_v2(text=message)
+
+    async def usage_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        oci_profiles, not_found = self.resolve_profiles(context.args)
+
+        if len(not_found) > 0:
+            await update.message.reply_markdown_v2(
+                text=f"profile not found: {markdown_list(not_found)}",
+                reply_to_message_id=update.message.message_id)
+        if len(oci_profiles) == 0:
+            return
+
+        results = await asyncio.gather(*[self.account_usage(oci_profile)
+                                         for oci_profile in oci_profiles], return_exceptions=True)
+
+        usages, failed = [], []
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning(f"fail to get usage, details: {result}")
+                continue
+            oci_profile, usage = result
+            if isinstance(usage, Status):
+                failed.append((oci_profile, usage))
+            else:
+                usages.append((oci_profile, usage))
+
+        if len(usages) == 0:
+            message = f"*Usage*: nothing readable\n```bash\n"
+            for oci_profile, status in failed:
+                message += f"  ❓ {oci_profile}: {status.code}\n"
+            message += f"```"
+            await update.message.reply_markdown_v2(text=message,
+                                                   reply_to_message_id=update.message.message_id)
+            return
+
+        usages = sorted(usages, key=lambda x: x[1].a1_ocpu_percent, reverse=True)
+        over = [usage for _, usage in usages if usage.over_grant]
+        billed = [(name, usage) for name, usage in usages if usage.billed]
+
+        header = (f"*Usage* {escape_markdown_v2(usages[0][1].period)}: "
+                  f"{len(over)} of {len(usages)} over the monthly free grant\n")
+        adjust = max([len(name) for name, _ in usages]) + 1
+
+        # 20 rows a message keeps it inside Telegram's size limit
+        for i in range(0, len(usages), 20):
+            message = header if i == 0 else ""
+            message += f"```bash\n"
+            message += (f"{'ACCOUNT'.ljust(adjust)} {'A1 OCPU-h':>11} {'%':>5} "
+                        f"{'A1 GB-h':>12} {'%':>5}  MONEY\n")
+            for name, usage in usages[i:i + 20]:
+                marker = "!" if usage.over_grant else " "
+                ocpu_cell = (f"{readable_number(round(usage.a1_ocpu_hours))}/"
+                             f"{readable_number(always_free_a1_ocpu_hours)}")
+                gb_cell = (f"{readable_number(round(usage.a1_gb_hours))}/"
+                           f"{readable_number(always_free_a1_gb_hours)}")
+                message += (f"{name.ljust(adjust)} {ocpu_cell:>11} "
+                            f"{usage.a1_ocpu_percent:>4.0f}%{marker}"
+                            f"{gb_cell:>12} {usage.a1_gb_percent:>4.0f}%  {usage.money}\n")
+            message += f"```\n"
+
+            if i == 0:
+                total_ocpu = sum([usage.a1_ocpu_hours for _, usage in usages])
+                total_gb = sum([usage.a1_gb_hours for _, usage in usages])
+                total_cost = sum([usage.cost or 0 for _, usage in usages])
+                currency = next((u.currency for _, u in usages if u.currency), "")
+                message += f"```bash\n"
+                message += (f"FLEET {len(usages)} accounts\n"
+                            f"  A1 OCPU-h : {readable_number(round(total_ocpu))} used of "
+                            f"{readable_number(always_free_a1_ocpu_hours * len(usages))} granted\n"
+                            f"  A1 GB-h   : {readable_number(round(total_gb))} used of "
+                            f"{readable_number(always_free_a1_gb_hours * len(usages))} granted\n"
+                            f"  money     : {total_cost:.2f} {currency}"
+                            f"{' (nothing billed)' if total_cost == 0 else ''}\n")
+                if len(billed) > 0:
+                    message += f"  billed    : {', '.join([name for name, _ in billed])}\n"
+                if len(failed) > 0:
+                    message += f"  unreadable: {len(failed)}\n"
+                message += f"```"
 
             if i == 0:
                 await update.message.reply_markdown_v2(
@@ -8602,6 +8939,7 @@ class TelegramCommandBot:
                           f"/subscription [profiles]               \\- subscription state\n"
                           f"/subscriptions [profiles]              \\- alias subscription\n"
                           f"/limit\\_check [profiles]                \\- free tier overage\n"
+                          f"/usage [profiles]                      \\- metered usage & cost\n"
                           f"\n"
                           # Instance Management
                           f"# Instance Management\n"
